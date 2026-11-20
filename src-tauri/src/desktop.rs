@@ -118,6 +118,8 @@ pub enum Action {
     Destroy,
     Restart,
     Stop,
+    #[cfg(target_os = "macos")]
+    ImportOfficial,
     CheckOfficialVersion,
     CheckCoreUpdate,
     CheckAppUpdate,
@@ -177,6 +179,8 @@ pub fn request(app: &AppHandle, action: Action) {
             Action::Destroy => "正在关闭窗口…",
             Action::Restart => "正在重启内核…",
             Action::Stop => "正在停止内核及其任务…",
+            #[cfg(target_os = "macos")]
+            Action::ImportOfficial => "正在导入官方 Orca 数据…",
             Action::CheckOfficialVersion => "正在查询 Orca 官方版本…",
             Action::CheckCoreUpdate => "正在检查内核更新…",
             Action::Update => "正在准备内核更新…",
@@ -245,6 +249,8 @@ async fn execute(app: &AppHandle, state: &AppState, action: Action) -> Result<()
             state.core.stop().await?;
             state.set_message(app, "内核已停止");
         }
+        #[cfg(target_os = "macos")]
+        Action::ImportOfficial => import_official(app, state).await?,
         Action::CheckOfficialVersion => {
             let latest = state.updater.latest_official_version().await?;
             *state
@@ -313,6 +319,103 @@ async fn execute(app: &AppHandle, state: &AppState, action: Action) -> Result<()
         Action::Restart => state.set_message(app, "内核重启完成"),
         Action::Rollback => state.set_message(app, "内核回退完成"),
         _ => {}
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+async fn import_official(app: &AppHandle, state: &AppState) -> Result<()> {
+    use crate::official_import;
+
+    let active = state.updater.load_active()?;
+    let version = if let Some(core) = &active {
+        core.manifest.version.clone()
+    } else {
+        let archive = bundled_core_archive(app).context("请先安装 Tauri 内核")?;
+        bundled_core_identity(&archive).await?.version
+    };
+    ensure!(
+        version == official_import::VERSION,
+        "导入需要 Tauri 内核 {}",
+        official_import::VERSION
+    );
+    ensure!(
+        !state
+            .paths
+            .core
+            .canonicalize()?
+            .starts_with(state.paths.runtime_data.canonicalize()?),
+        "请将内核安装在 Tauri 数据目录之外"
+    );
+    let target = state.paths.runtime_data.clone();
+    let stage_target = target.clone();
+    let staged = tokio::task::spawn_blocking(move || {
+        let source = official_import::discover()?;
+        official_import::prepare(&source, &stage_target)
+    })
+    .await??;
+
+    ensure!(!state.quitting.load(Ordering::SeqCst), "应用正在退出");
+    let reopen = window::current(app);
+    let was_running = state.core.status().phase == CorePhase::Running;
+    window::destroy(app, state).await?;
+    state.core.stop().await?;
+    ensure!(!state.quitting.load(Ordering::SeqCst), "应用正在退出");
+    let backup = staged.keep();
+    if let Err(error) = official_import::swap(&target, &backup) {
+        let _ = std::fs::remove_dir_all(&backup);
+        let recovery = restore_after_import(app, state, was_running, reopen).await;
+        recovery.with_context(|| format!("导入失败，恢复内核时也遇到错误：{error:#}"))?;
+        return Err(error);
+    }
+    if let Err(error) = ensure_started(app, state).await {
+        state.core.stop().await.with_context(|| {
+            format!(
+                "启动导入的数据失败。请退出后恢复原数据目录 {}：{error:#}",
+                backup.display()
+            )
+        })?;
+        official_import::swap(&target, &backup).with_context(|| {
+            format!(
+                "启动导入的数据失败。原数据目录在 {}：{error:#}",
+                backup.display()
+            )
+        })?;
+        let _ = std::fs::remove_dir_all(&backup);
+        restore_after_import(app, state, was_running, reopen)
+            .await
+            .with_context(|| format!("已恢复导入前的数据，但恢复内核时遇到错误：{error:#}"))?;
+        return Err(error).context("导入后内核启动失败，已恢复原数据");
+    }
+
+    if let Some(target) = reopen {
+        if let Err(error) = window::show(app, state, target).await {
+            tracing::warn!(%error, "could not reopen Orca after import");
+        }
+    }
+    state.set_message(
+        app,
+        format!(
+            "导入完成 · 原数据备份：{}",
+            backup.file_name().unwrap().to_string_lossy()
+        ),
+    );
+    notify(app, state, "官方 Orca 数据已导入。");
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+async fn restore_after_import(
+    app: &AppHandle,
+    state: &AppState,
+    was_running: bool,
+    reopen: Option<window::Target>,
+) -> Result<()> {
+    if was_running && !state.quitting.load(Ordering::SeqCst) {
+        ensure_started(app, state).await?;
+        if let Some(target) = reopen {
+            window::show(app, state, target).await?;
+        }
     }
     Ok(())
 }

@@ -4,6 +4,8 @@ pub mod updater;
 
 #[cfg(feature = "desktop")]
 mod desktop;
+#[cfg(all(target_os = "macos", any(feature = "desktop", test)))]
+mod official_import;
 #[cfg(any(feature = "desktop", test))]
 mod task_status;
 #[cfg(feature = "desktop")]

@@ -497,6 +497,7 @@ pub(crate) async fn tray_state(window: WebviewWindow, page: PanelPage) -> Result
         PanelPage::Settings => json!({
             "autostart": app.autolaunch().is_enabled().unwrap_or(false),
             "windowOpen": window::current(app).is_some(),
+            "importOfficial": cfg!(target_os = "macos"),
         }),
         PanelPage::About => {
             let active = state.updater.load_active().ok().flatten();
@@ -547,6 +548,8 @@ pub(crate) enum PanelAction {
         id: Option<String>,
     },
     OpenPaired,
+    #[cfg(target_os = "macos")]
+    ImportOfficial,
     CloseOrca,
     CheckApp,
     CheckCore,
@@ -638,6 +641,13 @@ pub(crate) async fn tray_action(window: WebviewWindow, action: PanelAction) -> R
             Action::ShowPaired
         }
         PanelAction::CloseOrca => Action::Destroy,
+        #[cfg(target_os = "macos")]
+        PanelAction::ImportOfficial => {
+            if state.is_busy() {
+                return Err("Orca 正忙，请稍后再试".into());
+            }
+            Action::ImportOfficial
+        }
         PanelAction::CheckApp => Action::CheckAppUpdate,
         PanelAction::CheckCore => Action::CheckCoreUpdate,
         PanelAction::CheckOfficial => Action::CheckOfficialVersion,

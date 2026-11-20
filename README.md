@@ -168,6 +168,12 @@ cargo tauri build --bundles nsis
 
 持久浏览器 profile 保留的是磁盘数据，不意味着保留隐藏 WebView。Windows/Linux 使用明确的 profile 目录；macOS WKWebView 使用平台持久存储机制，不能将其路径控制等同于 WebView2。
 
+### 从官方 Orca 导入
+
+在 Apple Silicon macOS 上，官方 Orca 和 Tauri 内核均为 v1.4.266 时，选托盘「设置 → 从官方 Orca 导入…」，确认后即可在「打开 Orca」查看导入的项目、工作树和已保存的对话及附件。官方 Orca 可以保持运行。导入会停止 Tauri 的后台任务并重启独立内核。
+
+每次导入使用官方版当前资料的项目和本机官方内核的内置聊天记录。导入前的 Tauri 数据完整保存在根目录下的 `orca-data-before-import-*`。要恢复，退出 Orca-Tauri，将当前 `orca-data` 移到其他位置，再把对应的备份改名为 `orca-data`。项目文件仍在原路径，SSH 连接及托管账号需要在 Tauri 中重新配置。
+
 ### 在 Orca-Tauri 中查看官方 Orca 会话
 
 1. 在官方 Orca 的「设置 → Orca 远程服务器 → 共享此电脑」中选择「此电脑」，生成访问链接并复制 `orca://pair?…` 链接。

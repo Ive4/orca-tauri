@@ -188,6 +188,8 @@ function renderSettings() {
       option("高级", () => go("advanced", true), "›"),
       option("连接官方 Orca…", () => action("open_paired"), "", locked),
     );
+    if (data.importOfficial) options.push(option("从官方 Orca 导入…", () =>
+      confirmAction("import_official", "导入当前资料的项目和官方 Orca 内置聊天记录。Tauri 会先备份原数据，重启内核时会结束正在运行的 Tauri 任务。", "导入"), "", locked));
     options.push(option("开机启动", () => action("autostart"), data.autostart ? "已开启" : "已关闭", locked));
     if (data.windowOpen) options.push(option("关闭 Orca 窗口", () => action("close_orca")));
     options.push(option("退出 Orca-Tauri", () => confirmAction("quit", "退出会停止后台运行的任务。", "退出")));
