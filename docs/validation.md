@@ -40,7 +40,7 @@ Windows 特有测试会强杀持有 Job 的 owner，再验证 core 与孙进程�
 | Windows 特殊分流 | packagedRipgrep / packagedBrowser 实际路径与提取器一致 |
 
 这些结果证明打包脚本不是基于猜测目录编写；它们不证明纯 Node 在 Windows Job 内已经启动成功。
-固定摘要和来源在 `core-version.json`；摘要核对汇总见 `installer-audit.json`。
+该版本的摘要核对汇总见 `installer-audit.json`。当前锁定的来源与摘要见 `core-version.json`。
 
 ## 未完成的运行资格
 
@@ -84,3 +84,17 @@ GitHub Windows runner 的 gate 也不能替代 Windows 11 上的 WebView2 交互
 带窗口退出的初版会在销毁最后一个窗口时响应 Tauri 的隐式退出事件，提前结束正常清理。修正后由清理流程显式结束应用，最终包在同一验收场景通过。
 
 本次使用已安装官方 Orca 的测试机。Core 监听进程为包内 Node。WKWebView 用例中还观察到上游从官方应用启动的浏览器 sidecar，该 sidecar 属于测试 Core 的进程组并随之回收。干净机器、macOS 13.5 实机、强杀后的进程回收、启动耗时与内存对照、Apple notarization 尚未验收。
+
+## Orca v1.4.266 验证
+
+2026-11-20 核对上游标签指向提交 `903c91e80fbe7bbcaffe6ac767c49eac91e98a64`。两个官方安装包的 SHA-256 均与 Release 一致。macOS 包的 `orca-local-build.json` 记录工作流提交 `3df243e7d5610fe956c7776144571c7d3640fadb`。上游构建日志确认签名包检出 v1.4.266 标签，两个提交分别用于签名包元数据和源码校验。[上游 Release](https://github.com/stablyai/orca/releases/tag/v1.4.266) · [macOS 构建日志](https://github.com/stablyai/orca/actions/runs/44699155799)
+
+Apple Silicon 用官方签名的 macOS 包和锁定的源码重建 Web、Orcad 及插件 Worker。历史修订 `0.0.2` 随附 Bun 1.4.4 和 SQLite 3.54.1，通过原生模块加载、真实 PTY、回环就绪、Web HTTP 200 和进程回收检查。
+
+试用修订 `0.0.3` 随附 Node.js 26.13.1，运行时槽为 `0.1.0+4332a7f1a5e8`。在同一 Apple Silicon 主机上，空配置冷启动后 20 秒的两次采样中位数显示，Node 的 RSS 为 554.1 MiB，Bun 为 689.2 MiB。Node 的 `phys_footprint` 为 520.4 MiB，Bun 为 244.2 MiB。
+
+修订 `0.0.4` 恢复 Bun 1.4.4 与 SQLite 3.54.1。Bun、Orcad 服务端和插件 Worker 与 `0.0.2` 的归档逐字节一致，运行时槽仍为 `0.1.0+0fe28c867adb`。在 macOS 27.2.1 实测空配置首启、真实 PTY，以及分别从 `0.0.2` 和 `0.0.3` 切换后重启。两组隔离配置都保留安装身份和上一内核槽，SQLite 完整性检查通过，退出后归还端口。应用包通过 ad hoc 签名校验。
+
+Windows x64 在 Apple Silicon 上静态解包。NSIS 布局与提取脚本匹配，433 个 Core 槽文件摘要匹配，Web 清单中 1,513 个文件全部存在，槽版本为 `0.1.0+0f56ac48f96c`。Windows 11 的 ConPTY、Job 回收和 WebView2 需原生验收。
+
+浏览器配对入口、持久环境和主机身份匹配源码与 v1.4.264 一致。配对脚本的 18 项测试通过。v1.4.266 的 WKWebView 交互仍待验收。

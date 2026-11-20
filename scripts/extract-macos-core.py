@@ -90,27 +90,6 @@ def download(url, destination, digest=None, timeout=180):
         check_hash(destination, digest)
 
 
-def stage_node(lock, work, stage, node_archive):
-    pin = lock['node']
-    version = pin['version']
-    name = f'node-v{version}-darwin-arm64'
-    if node_archive is None:
-        node_archive = work / 'node.tar.gz'
-        download(f'https://nodejs.org/dist/v{version}/{name}.tar.gz',
-                 node_archive, pin['archive_sha256'])
-    else:
-        check_hash(node_archive, pin['archive_sha256'])
-    node = stage / f'runtimes/node-{pin["executable_sha256"]}/bin/node'
-    node.parent.mkdir(parents=True)
-    with tarfile.open(node_archive, 'r:gz') as archive:
-        for source, output in ((f'{name}/bin/node', node), (f'{name}/LICENSE', stage / 'licenses/NODE-LICENSE')):
-            with archive.extractfile(source) as input_file, output.open('wb') as output_file:
-                shutil.copyfileobj(input_file, output_file)
-    check_hash(node, pin['executable_sha256'])
-    node.chmod(0o755)
-    return node
-
-
 def stage_bun(lock, work, stage, bun_archive, sqlite_archive):
     pin = lock['bun']
     version = pin['version']
@@ -232,8 +211,9 @@ def stage_core(args, lock, work, stage):
                     '-R=' + signing_requirement, app], check=True)
     resources = app / 'Contents/Resources'
     build = json.loads((resources / 'orca-local-build.json').read_text())
+    # The official app records the workflow commit. We rebuild from its tag checkout.
     require((build['version'], build['commit'], build['architecture']) ==
-            (lock['version'].removeprefix('v'), upstream['commit'], 'arm64'),
+            (lock['version'].removeprefix('v'), upstream['app_build_commit'], 'arm64'),
             'Orca.app does not match core-version.macos-arm64.json')
 
     template = resources / 'orcad-template'
@@ -252,6 +232,7 @@ def stage_core(args, lock, work, stage):
     browser_root = resources if native.get('packagedBrowser') else native_root
     copy_resource(safe_path(browser_root, browser), safe_path(slot, browser), native['browserSha256'])
     for name in (browser, 'node_modules/node-pty/build/Release/spawn-helper',
+                 'node_modules/node-pty/build/Release/journal-file-lock',
                  'bin/orca-provider-exec', 'ripgrep/darwin-arm64/rg'):
         binary = safe_path(slot, name)
         binary.chmod(binary.stat().st_mode | 0o111)
@@ -265,23 +246,20 @@ def stage_core(args, lock, work, stage):
 
     licenses = stage / 'licenses'
     licenses.mkdir()
-    require((slot / '.runtime-node').read_text().strip() == lock['node']['executable_sha256'] and
+    require((slot / '.runtime-node').read_text().strip() == upstream['node_executable_sha256'] and
             (slot / '.server-target').read_text().strip() == target,
             'Official Orcad slot does not match the upstream runtime pin or target')
 
     verifier = runpy.run_path(str(ROOT / 'scripts/verify-bun-macos.py'))
-    if args.runtime == 'bun':
-        runtime = stage_bun(lock, work, stage, args.bun_archive, args.sqlite_archive)
-        adapt_bun_slot(slot, runtime, lock, verifier)
-    else:
-        runtime = stage_node(lock, work, stage, args.node_archive)
+    runtime = stage_bun(lock, work, stage, args.bun_archive, args.sqlite_archive)
+    adapt_bun_slot(slot, runtime, lock, verifier)
 
     base = f'https://raw.githubusercontent.com/stablyai/orca/{upstream["commit"]}'
     source = work / 'orcad-artifacts.ts'
     download(f'{base}/{INVENTORY_SOURCE}', source, upstream['artifact_source_sha256'])
     download(f'{base}/LICENSE', licenses / 'ORCA-LICENSE', upstream['license_sha256'])
     env = {k: v for k, v in os.environ.items() if not k.startswith(('ELECTRON_', 'ORCA_', 'NODE_', 'BUN_'))}
-    runtime_env = {'BUN_OPTIONS': '--no-env-file', 'DO_NOT_TRACK': '1'} if args.runtime == 'bun' else {}
+    runtime_env = {'BUN_OPTIONS': '--no-env-file', 'DO_NOT_TRACK': '1'}
     env.update(runtime_env)
     version = subprocess.check_output([runtime, '-e', SLOT_VERSION, source, slot, browser], env=env, text=True)
     (slot / '.version').write_text(version + '\n')
@@ -305,16 +283,15 @@ def stage_core(args, lock, work, stage):
         'health_path': '/web-index.html', 'ui_path': '/web-index.html',
         'upstream_commit': upstream['commit'], 'slot_version': version,
         'plugin_host': 'web-plugins-v2',
-        'runtime': args.runtime, f'{args.runtime}_version': lock[args.runtime]['version'],
-        f'{args.runtime}_sha256': lock[args.runtime]['executable_sha256'],
+        'runtime': 'bun', 'bun_version': lock['bun']['version'],
+        'bun_sha256': lock['bun']['executable_sha256'],
     }
     (stage / 'core-manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
     copy_resource(ROOT / 'core-version.macos-arm64.json', stage / 'upstream-lock.json')
     profile = work / 'boot-profile'
     profile.mkdir(mode=0o700)
     verifier['verify_start'](runtime, stage, manifest, profile)
-    if args.runtime == 'bun':
-        verifier['verify_start'](runtime, stage, manifest, profile)
+    verifier['verify_start'](runtime, stage, manifest, profile)
 
 
 def main():
@@ -322,17 +299,11 @@ def main():
     source = parser.add_mutually_exclusive_group()
     source.add_argument('--orca-app', type=Path, default=Path('/Applications/Orca.app'))
     source.add_argument('--download-orca', action='store_true', help='Download the pinned official Orca.app')
-    parser.add_argument('--runtime', choices=('bun', 'node'), default='bun')
     parser.add_argument('--upstream-source-archive', type=Path)
-    parser.add_argument('--node-archive', type=Path)
     parser.add_argument('--bun-archive', type=Path)
     parser.add_argument('--sqlite-archive', type=Path)
     parser.add_argument('--output', type=Path)
     args = parser.parse_args()
-    if args.runtime == 'bun' and args.node_archive is not None:
-        parser.error('--node-archive requires --runtime node')
-    if args.runtime == 'node' and (args.bun_archive is not None or args.sqlite_archive is not None):
-        parser.error('--bun-archive and --sqlite-archive require --runtime bun')
 
     require(platform.system() == 'Darwin' and platform.machine() == 'arm64', 'Use an Apple Silicon Mac')
     lock = json.loads((ROOT / 'core-version.macos-arm64.json').read_text())
@@ -340,8 +311,7 @@ def main():
     require(re.fullmatch(f'v{stable}', lock['version'])
             and re.fullmatch(stable, lock['package_revision'])
             and lock['package_revision'] != '0.0.0', 'Invalid core package version')
-    default_output = f'macos-arm64-{args.runtime}-plugins'
-    output = (args.output or ROOT / 'dist-core' / default_output).resolve()
+    output = (args.output or ROOT / 'dist-core/macos-arm64-bun-plugins').resolve()
     output.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='.macos-core-', dir=output) as directory:
         work = Path(directory)
@@ -373,7 +343,7 @@ def main():
         checksum.replace(output / checksum.name)
         bootstrap.replace(output / bootstrap.name)
         seed.replace(output / seed.name)
-    print(f'Mac Core ({args.runtime}) packaged at {output}')
+    print(f'Mac Core (Bun) packaged at {output}')
 
 
 if __name__ == '__main__':

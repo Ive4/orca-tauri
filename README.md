@@ -4,7 +4,7 @@ Tauri v2 桌面壳在系统托盘常驻，按需创建官方 Orca 的浏览器�
 
 **先开发 Apple Silicon macOS 版，再完成 Windows 11 x64 版。** GitHub Actions 为两个平台打包随附初始 Core 的 Orca-Tauri，也支持独立发布 Core。
 
-1. **macOS**。从官方安装包提取 `darwin-arm64` Core 槽及同版 Web 资源，默认用锁定的 arm64 Bun 启动。实机验证进程回收、配对与重连，再用同版本官方 Orca 对比启动到可操作、会话切换和整套进程内存。
+1. **macOS**。从官方安装包提取 `darwin-arm64` Core 槽及同版 Web 资源，用锁定的 arm64 Bun 启动。实机验证进程回收、配对与重连，再用同版本官方 Orca 对比启动到可操作、会话切换和整套进程内存。
 2. **Windows**。使用已有的 Windows x64 提取、ConPTY 和 Job 回收实现，完成 WebView2 实机配对、安装和性能验证。
 
 本项目没有前端框架或 npm 构建步骤。`assets/index.html` 只是 Tauri 构建所需的空资产；实际窗口加载本机内核的官方 `/web-index.html`。`assets/pairing-init.js` 是一个很小、带回归测试的配对兼容脚本。
@@ -31,13 +31,13 @@ Tauri v2 桌面壳在系统托盘常驻，按需创建官方 Orca 的浏览器�
 
 托盘的 **设置 → 关于与更新** 显示外壳和当前激活的内核版本。
 
-1. **内核版本**显示 `<打包修订>-<官方版本>`。Windows 随附 `0.0.1-1.4.264`，macOS 随附 `0.0.1-1.4.265`。本地 Web UI 随内核一起更新和回退。旧包缺少修订字段时，显示 `0.0.0-<官方版本>`。
+1. **内核版本**显示 `<打包修订>-<官方版本>`。macOS 当前锁定 `0.0.4-1.4.266`，Windows 为 `0.0.1-1.4.266`。本地 Web UI 随内核更新。旧包缺少修订字段时，显示 `0.0.0-<官方版本>`。
 2. **外壳版本**来自 `src-tauri/Cargo.toml`，当前为 `0.1.0`。Tauri 安装包和外壳更新使用这个版本。
 3. **查询 Orca 官方最新稳定版…**读取 `stablyai/orca` 的最新稳定 Release，和当前激活的内核的官方基线比较。同一主、次版本可看到补丁版本号差值。
 
 两个平台的 `core-version*.json` 分别固定 `version`（官方 Release 标签）和 `package_revision`（本项目打包修订）。同一个官方版本再次打包发布时，递增该平台的 `package_revision`。升级官方基线后可从 `0.0.1` 开始。清单中的 `environment.ORCA_VERSION` 供启动时核对运行时槽身份。
 
-产品版本存在于官方 Release；初始官方安装器已经实际下载并核对摘要，静态解包后逐项验证了 337 个 Windows 槽文件及 1,375 个 Web UI 文件。**静态产物核对不等于 Windows 冒烟通过**，锁文件使用 `archive-verified-awaiting-windows-smoke` 标记此状态。更换 core 不要求重编译壳，但如果上游改变 readiness、配对存储或打包契约，仍需要兼容性检查或修改壳。
+Windows v1.4.266 官方安装器已核对摘要，静态解包后逐项验证了 433 个 Core 槽文件及 1,513 个 Web UI 文件。锁文件标记为 `archive-verified-awaiting-windows-smoke`，Windows 原生冒烟仍待执行。版本升级时需要核对 readiness、配对存储和打包契约。
 
 完整一手资料、固定摘要和实际包布局见 [docs/upstream-compatibility.md](docs/upstream-compatibility.md)。
 
@@ -54,7 +54,7 @@ Tauri v2 桌面壳在系统托盘常驻，按需创建官方 Orca 的浏览器�
 
 ## Apple Silicon macOS 构建
 
-构建需要 Rust stable、Xcode Command Line Tools、Python 3.9+、Node.js 24+ 与 npm，以及与 `core-version.macos-arm64.json` 匹配的官方 `/Applications/Orca.app`。
+构建需要 Rust stable、Xcode Command Line Tools、Python 3.9+、Node.js 24+ 与 npm，以及与 `core-version.macos-arm64.json` 匹配的官方 `/Applications/Orca.app`。Node.js 用于构建上游源码，应用随包运行 Bun。
 
 ```sh
 ./scripts/build-macos.sh
@@ -62,7 +62,7 @@ Tauri v2 桌面壳在系统托盘常驻，按需创建官方 Orca 的浏览器�
 
 默认生成 `target/aarch64-apple-darwin/release/bundle/macos/Orca-Tauri.app`，随附 Bun 1.4.4 和从固定源码编译的 SQLite 3.54.1。独立内核 ZIP 和 SHA-256 位于 `dist-core/macos-arm64-bun-plugins/`。可用 `--bun-archive` 和 `--sqlite-archive` 复用已有下载。
 
-需要 Node 版时，运行 `./scripts/build-macos.sh --runtime node`，同名产物随附 Node 24.22.1。可用 `--node-archive` 复用 Node 压缩包。两种构建都支持 `--orca-app /path/to/Orca.app` 或 `--download-orca`。脚本校验官方签名和文件摘要，再以锁定的上游源码、pnpm 依赖锁和项目补丁重建 `orcad-server.js` 与 Web 界面。可用 `--upstream-source-archive` 指向已下载的固定提交源码压缩包。打包前会运行原生模块加载、真实 PTY 和回环 HTTP 检查。应用声明的系统下限为 macOS 13.5。本地构建默认使用临时签名。
+可用 `--orca-app /path/to/Orca.app` 指定官方应用，或用 `--download-orca` 下载。脚本校验官方签名和文件摘要，再以锁定的上游源码、pnpm 依赖锁和项目补丁重建 `orcad-server.js` 与 Web 界面。可用 `--upstream-source-archive` 指向已下载的固定提交源码压缩包。打包前会运行原生模块加载、真实 PTY 和回环 HTTP 检查。应用声明的系统下限为 macOS 13.5。本地构建默认使用临时签名。
 
 点击菜单栏图标查看任务，在弹窗内选中任务或点击「打开 Orca」打开主窗口。**Command+Shift+O** 也可直接打开主窗口。空数据目录首启从应用资源安装 Core，核对就绪和配对信息后激活。已有 `~/.orca-tauri` 的有效 Core 优先启动。使用独立的绝对路径 `ORCA_TAURI_HOME` 可以试用另一种运行时。
 
@@ -96,10 +96,10 @@ pwsh -NoProfile -File ./scripts/extract-headless.ps1
 然后退出托盘里的壳，以避免本地服务端口被占用，安装刚产生的包：
 
 ```powershell
-$coreArchive = Resolve-Path ./dist-core/orca-core-v0.0.1-1.4.264-x86_64-pc-windows-msvc.zip
+$coreArchive = Resolve-Path ./dist-core/orca-core-v0.0.1-1.4.266-x86_64-pc-windows-msvc.zip
 $coreDigest = (Get-FileHash -LiteralPath $coreArchive -Algorithm SHA256).Hash.ToLowerInvariant()
 cargo run --locked --no-default-features --example install_core -- `
-  "$coreArchive" v1.4.264 "$coreDigest"
+  "$coreArchive" v1.4.266 "$coreDigest"
 cargo tauri dev
 ```
 
@@ -110,10 +110,10 @@ cargo tauri dev
 将本项目提交到自己的 GitHub 仓库。在 `main` 上运行 **Qualify and release headless core**，选择 `publish=true`。验证成功后生成如下资产：
 
 ```text
-Release: core-windows-v0.0.1-1.4.264
-orca-core-v0.0.1-1.4.264-x86_64-pc-windows-msvc.zip
-orca-core-v0.0.1-1.4.264-x86_64-pc-windows-msvc.zip.sha256
-orca-core-v0.0.1-1.4.264-x86_64-pc-windows-msvc-validation.json
+Release: core-windows-v0.0.1-1.4.266
+orca-core-v0.0.1-1.4.266-x86_64-pc-windows-msvc.zip
+orca-core-v0.0.1-1.4.266-x86_64-pc-windows-msvc.zip.sha256
+orca-core-v0.0.1-1.4.266-x86_64-pc-windows-msvc-validation.json
 ```
 
 从托盘“设置 → 高级 → 打开配置文件”打开 `config.json`，填写 `update_repository`，例如 `your-name/orca-tauri`。**编辑配置后退出并重新启动壳，配置才生效**；只点“重启内核”不会重新读取配置。
@@ -164,7 +164,7 @@ cargo tauri build --bundles nsis
 
 官方会话由运行中的官方 Orca 提供。两个入口分别保存配对，两个内核分别管理自己的数据。更改 Orca-Tauri 的端口会改变 WebView 的存储来源，官方入口需要重新配对。
 
-在 Orca 中选择「简体中文」即可使用 Bots 补译。壳在 WebView 加载官方语言目录时按键补齐缺失词条，官方目录一旦提供对应译文就会自动优先使用。补译见 [bots-i18n.zh.json](assets/bots-i18n.zh.json)，基于 macOS 锁定的 Orca v1.4.265。
+在 Orca 中选择「简体中文」即可使用 Bots 补译。壳在 WebView 加载官方语言目录时按键补齐缺失词条，官方目录一旦提供对应译文就会自动优先使用。补译键已与 Orca v1.4.266 的英文目录核对。[bots-i18n.zh.json](assets/bots-i18n.zh.json)
 
 完整示例为 [config.example.json](config.example.json)，主要配置如下：
 

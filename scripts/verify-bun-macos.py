@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare the pinned macOS Core on Node and Bun in disposable profiles."""
+"""Verify a packaged macOS Bun Core in a disposable profile."""
 
 import argparse
 import hashlib
@@ -8,7 +8,6 @@ import os
 from pathlib import Path
 import platform
 import queue
-import shutil
 import signal
 import socket
 import subprocess
@@ -19,8 +18,7 @@ import urllib.request
 import zipfile
 
 ROOT = Path(__file__).resolve().parent.parent
-BUN_SHA256 = '0a2237cdcfa0d16ef501d9acca9f0026309ef348bea7393a64e8d1e3609565cc'
-SERVER_SHA256 = 'e5a295ffafbd11bcddc0de42b4d3632f1ba5d12f1413e5d9c59174fce4b23553'
+
 TERMINAL_SHA256 = '1eeb6ec476884b533f1648f50d9571eda031b0928f35174c0d74feabc3e03bd6'
 
 # Bun's TTY stream aborts on EAGAIN. Retry on the same fd until bytes arrive,
@@ -55,12 +53,12 @@ def verify(path, expected):
         raise ValueError(f'SHA-256 mismatch for {path.name}')
 
 
-def patch_file(path, expected, original, replacement, prefix=''):
+def patch_file(path, expected, original, replacement):
     verify(path, expected)
     source = path.read_text()
     if source.count(original) != 1:
         raise ValueError(f'Compatibility patch no longer matches {path.name}')
-    path.write_text(prefix + source.replace(original, replacement))
+    path.write_text(source.replace(original, replacement))
 
 
 def unpack_core(archive, destination):
@@ -109,12 +107,12 @@ def verify_start(runtime, core, manifest, profile):
     with socket.socket() as listener:
         listener.bind(('127.0.0.1', 0))
         port = listener.getsockname()[1]
+    variables = dict(host='127.0.0.1', port=port, core_dir=core, data_dir=profile)
     env = {
         'PATH': '/usr/bin:/bin',
         'HOME': str(profile),
         'TMPDIR': str(profile),
-        **{key: value.replace('{data_dir}', str(profile))
-           for key, value in manifest['environment'].items()},
+        **{key: value.format_map(variables) for key, value in manifest['environment'].items()},
     }
     ready = queue.Queue()
 
@@ -130,9 +128,9 @@ def verify_start(runtime, core, manifest, profile):
         ready.put(None)
 
     with subprocess.Popen(
-        [str(runtime), str(core / 'orcad/orcad-server.js'), '--bind', '127.0.0.1',
-         '--port', str(port), '--web-client-root', str(core / 'web'), '--json'],
-        cwd=core / 'orcad', env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        [str(runtime), *(arg.format_map(variables) for arg in manifest['args'])],
+        cwd=core / manifest['working_directory'], env=env, stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
         start_new_session=True,
     ) as process:
         reader = threading.Thread(target=read_events, args=(process.stdout,), daemon=True)
@@ -161,16 +159,11 @@ def verify_start(runtime, core, manifest, profile):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--bun', type=Path, required=True, help='Bun 1.4.4 macOS arm64 binary')
-    parser.add_argument('--sqlite', type=Path,
-                        default=Path('/opt/homebrew/opt/sqlite/lib/libsqlite3.dylib'))
-    parser.add_argument('--core-dir', type=Path, default=ROOT / 'dist-core/macos-arm64')
+    parser.add_argument('--core-dir', type=Path, default=ROOT / 'dist-core/macos-arm64-bun-plugins')
     args = parser.parse_args()
 
     if platform.system() != 'Darwin' or platform.machine() != 'arm64':
-        raise SystemExit('This experiment requires Apple Silicon macOS')
-    verify(args.bun, BUN_SHA256)
-    sqlite = args.sqlite.resolve(strict=True)
+        raise SystemExit('This check requires Apple Silicon macOS')
     archive = args.core_dir / 'bootstrap-core.zip'
     seed = json.loads((args.core_dir / 'bootstrap-core.json').read_text())
     verify(archive, seed['sha256'])
@@ -181,30 +174,23 @@ def main():
         unpack_core(archive, core)
         manifest = json.loads((core / 'core-manifest.json').read_text())
         lock = json.loads((ROOT / 'core-version.macos-arm64.json').read_text())
-        if (manifest['version'], manifest['target'], manifest['upstream_commit']) != (
-            lock['version'], lock['target'], lock['upstream']['commit'],
+        bun = lock['bun']
+        executable = f'runtimes/bun-{bun["version"]}/bun'
+        if (manifest['version'], manifest['package_revision'], manifest['target'],
+            manifest['upstream_commit'], manifest['runtime'], manifest['executable'],
+            manifest['bun_version'], manifest['bun_sha256']) != (
+            lock['version'], lock['package_revision'], lock['target'],
+            lock['upstream']['commit'], 'bun', executable,
+            bun['version'], bun['executable_sha256'],
         ):
             raise ValueError('Core archive differs from the pinned macOS release')
-        node = core / f'runtimes/node-{lock["node"]["executable_sha256"]}/bin/node'
-        verify(node, lock['node']['executable_sha256'])
-        node_profile = scratch / 'node-profile'
-        node_profile.mkdir(mode=0o700)
-        verify_start(node, core, manifest, node_profile)
-        print('Node baseline: readiness, real PTY, HTTP and process cleanup passed')
-
-        runtime = scratch / 'bun'
-        shutil.copy2(args.bun, runtime)
-        profile = scratch / 'bun-profile'
+        runtime = core / executable
+        verify(runtime, bun['executable_sha256'])
+        if subprocess.check_output([runtime, '--version'], text=True).strip() != bun['version']:
+            raise ValueError('Packaged Bun version differs from the lock')
+        profile = scratch / 'profile'
         profile.mkdir(mode=0o700)
 
-        guard = 'function bla(){'
-        allow_pinned_bun = (
-            f'if(process.versions.bun==="1.4.4"&&process.execPath==={json.dumps(str(runtime))})return;'
-        )
-        patch_file(core / 'orcad/orcad-server.js', SERVER_SHA256, guard, guard + allow_pinned_bun,
-                   prefix=f'require("bun:sqlite").Database.setCustomSQLite({json.dumps(str(sqlite))});\n')
-        patch_file(core / 'orcad/node_modules/node-pty/lib/unixTerminal.js',
-                   TERMINAL_SHA256, 'new tty.ReadStream(term.fd)', BUN_PTY_STREAM)
         for stage in ('fresh profile', 'same-profile restart'):
             verify_start(runtime, core, manifest, profile)
             print(f'Bun {stage}: readiness, real PTY, HTTP and process cleanup passed')

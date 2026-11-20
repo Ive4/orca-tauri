@@ -10,7 +10,7 @@ release validation.
 - Cold startup creates no WebView. Closing/toggling a window destroys it; never
   replace this with a hidden always-alive window.
 - Launch the pinned standalone runtime directly with `orcad-server.js`.
-  Package Bun by default on macOS, with a Node-only build option. Windows uses Node.
+  Package Bun on macOS and Node on Windows.
   Do not switch to the official Electron launcher or enable its fallback.
 - Windows process ownership starts **inside CreateProcess** using
   `PROC_THREAD_ATTRIBUTE_JOB_LIST`. Keep `KILL_ON_JOB_CLOSE`, no breakaway,

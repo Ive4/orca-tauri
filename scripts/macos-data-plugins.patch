@@ -1361,7 +1361,7 @@ index a5499e20..cd37114d 100644
    if (needsOrca) {
      return (
 diff --git a/src/renderer/src/components/plugins/catalog/PluginCatalogGroups.tsx b/src/renderer/src/components/plugins/catalog/PluginCatalogGroups.tsx
-index bd3c616b..5221fc7f 100644
+index bd3c616b..195a526a 100644
 --- a/src/renderer/src/components/plugins/catalog/PluginCatalogGroups.tsx
 +++ b/src/renderer/src/components/plugins/catalog/PluginCatalogGroups.tsx
 @@ -111,18 +111,20 @@ export function CatalogCard({
@@ -1410,6 +1410,15 @@ index bd3c616b..5221fc7f 100644
        onIntentEnd={handlers.prefetch.cancel}
        action={
          <PluginCardAction
+@@ -257,7 +263,7 @@ export function PluginCatalogGroups({
+         const listedTotal = listed.filter(
+           (entry) => entry.listing?.marketplaceSourceId === source.id
+         ).length
+-        if (narrowed && rows.length === 0) {
++        if (narrowed && rows.length === 0 && !source.error) {
+           return null
+         }
+         const failed = Boolean(source.error)
 @@ -296,7 +302,9 @@ export function PluginCatalogGroups({
                    ? t(
                        'auto.components.settings.PluginManager.sourceStaleBody',
@@ -1421,19 +1430,144 @@ index bd3c616b..5221fc7f 100644
                      )
                    : ''
                }
+diff --git a/src/renderer/src/components/plugins/list/PluginCard.tsx b/src/renderer/src/components/plugins/list/PluginCard.tsx
+index 1940e2a9..85eb73db 100644
+--- a/src/renderer/src/components/plugins/list/PluginCard.tsx
++++ b/src/renderer/src/components/plugins/list/PluginCard.tsx
+@@ -1,4 +1,5 @@
+ import { BadgeCheck, Check } from 'lucide-react'
++import { isWebClientLocation } from '@/app-shell/platform/web-client-location'
+ import { useIntlLocale, useTranslate } from '@/i18n/use-translate'
+ import { pluginOfficialLabel } from '../presentation/plugin-official-label'
+ import { Badge } from '../../ui/badge'
+@@ -46,9 +47,11 @@ export function PluginCard({
+   const t = useTranslate()
+   const intlLocale = useIntlLocale()
+   const installCount = usePluginInstallCount(entry)
+-  const cover =
+-    servedPluginHostImages(entry.installed?.images)?.cover ??
+-    servedPluginHostImages(entry.listing?.images)?.cover
++  // The catalog's verified image URLs require the desktop protocol.
++  const cover = isWebClientLocation()
++    ? undefined
++    : (servedPluginHostImages(entry.installed?.images)?.cover ??
++      servedPluginHostImages(entry.listing?.images)?.cover)
+   return (
+     <li
+       data-plugin-key={entry.pluginKey}
+diff --git a/src/renderer/src/components/plugins/list/PluginCatalogLayout.tsx b/src/renderer/src/components/plugins/list/PluginCatalogLayout.tsx
+index 671e5ccf..db8cdd09 100644
+--- a/src/renderer/src/components/plugins/list/PluginCatalogLayout.tsx
++++ b/src/renderer/src/components/plugins/list/PluginCatalogLayout.tsx
+@@ -78,11 +78,11 @@ export function PluginCatalogLayout({
+             ) : null}
+           </TabsList>
+         </Tabs>
+-        <div className="relative min-w-56 grow @max-xl/plugin-list:order-last @max-xl/plugin-list:basis-full">
++        <div className="relative min-w-0 grow basis-56 @max-xl/plugin-list:order-last @max-xl/plugin-list:basis-full">
+           <Search className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" />
+           <Input
+             value={search}
+-            className="pl-9"
++            className="pr-9 pl-9"
+             aria-label={t(
+               'auto.components.pluginCatalog.PluginCatalogLayout.searchLabel',
+               'Search plugins'
+diff --git a/src/renderer/src/components/plugins/list/PluginManager.tsx b/src/renderer/src/components/plugins/list/PluginManager.tsx
+index 04bb112b..b8dcc769 100644
+--- a/src/renderer/src/components/plugins/list/PluginManager.tsx
++++ b/src/renderer/src/components/plugins/list/PluginManager.tsx
+@@ -185,7 +185,13 @@ export function PluginManager({
+     filter === 'installed' || filter === 'updates'
+       ? visibleInstalled.length
+       : visibleCatalogCount + (filter === 'all' ? uncataloged.length : 0)
+-  const nothingMatches = narrowed && resultCount === 0
++  const waitingForResults =
++    filter === 'installed' || filter === 'updates'
++      ? pluginsLoading || pluginsError
++      : catalog.loading ||
++        catalog.error ||
++        catalog.sources.some((source) => source.error && !source.marketplace)
++  const nothingMatches = narrowed && resultCount === 0 && !waitingForResults
+   const everythingInstalled =
+     filter === 'available' &&
+     !narrowed &&
+diff --git a/src/renderer/src/components/plugins/list/PluginSettingsOverview.tsx b/src/renderer/src/components/plugins/list/PluginSettingsOverview.tsx
+index 1f42f5db..799fd110 100644
+--- a/src/renderer/src/components/plugins/list/PluginSettingsOverview.tsx
++++ b/src/renderer/src/components/plugins/list/PluginSettingsOverview.tsx
+@@ -50,7 +50,11 @@ export function PluginSettingsOverview({
+   return (
+     <>
+       {featureEnabled ? null : <PluginsOffState />}
+-      {settingsError ? <p className="text-xs text-destructive">{settingsError}</p> : null}
++      {settingsError ? (
++        <p role="alert" className="text-xs text-destructive">
++          {settingsError}
++        </p>
++      ) : null}
+       {featureEnabled ? (
+         <PluginManager
+           plugins={plugins}
 diff --git a/src/renderer/src/components/plugins/list/PluginsSettingsSection.tsx b/src/renderer/src/components/plugins/list/PluginsSettingsSection.tsx
-index 2516cca3..37a6bdc8 100644
+index 2516cca3..583376ca 100644
 --- a/src/renderer/src/components/plugins/list/PluginsSettingsSection.tsx
 +++ b/src/renderer/src/components/plugins/list/PluginsSettingsSection.tsx
-@@ -1,3 +1,6 @@
-+import { Button } from '../../ui/button'
+@@ -1,3 +1,5 @@
 +import { PluginAddMenu } from './PluginAddMenu'
 +import { dataPluginMarketplace } from '@/web/preload-api/host-capabilities/web-data-plugin-capability'
  import { isPluginAutoUpdateOn } from '../../../../../shared/plugins/catalog/plugin-update-policy'
  import { useEffect, useEffectEvent, useRef, useState } from 'react'
  import { toast } from 'sonner'
-@@ -337,18 +340,37 @@ export function PluginsSettingsSection({
-       hideHeader={featureEnabled && page.openKey !== null}
+@@ -18,6 +20,9 @@ import { PluginsAlphaNotice } from './PluginsAlphaNotice'
+ import { PluginsSectionDescription } from './PluginsSectionDescription'
+ import { getPluginsSectionPresentation } from '../../settings/plugins/plugins-search'
+ import { SettingsSection } from '../../settings/section-layout/SettingsSection'
++import { SettingsGroup } from '../../settings/section-layout/SettingsGroup'
++import { SettingsRow } from '../../settings/form-controls/SettingsFormControls'
++import { Switch } from '../../ui/switch'
+ import { usePluginLogs } from '../state/use-plugin-logs'
+ import { usePluginMarketplaceLifecycle } from '../state/use-plugin-marketplace-lifecycle'
+ import { usePluginPageNavigation } from '../state/use-plugin-page-navigation'
+@@ -138,8 +143,10 @@ export function PluginsSettingsSection({
+ 
+   const {
+     devPathsBusy,
++    systemBusy,
+     settingsError,
+     reset: resetSettingsWrites,
++    setSystemEnabled,
+     toggleSuggestions,
+     toggleAutoUpdate,
+     updateDevPaths
+@@ -329,29 +336,68 @@ export function PluginsSettingsSection({
+   }
+ 
+   const featureEnabled = settings.pluginSystemEnabled
++  const pairedPluginHost = Boolean(dataPluginMarketplace())
++  const showingDetail = featureEnabled && page.openKey !== null
++  const switchLabel = t(
++    'auto.components.settings.PluginsSettingsSection.systemLabel',
++    'Plugin system'
++  )
+   return (
+     <SettingsSection
+       id="plugins"
+       {...sectionPresentation}
+-      description={<PluginsSectionDescription text={sectionPresentation.description} />}
+-      hideHeader={featureEnabled && page.openKey !== null}
++      badge={pairedPluginHost ? undefined : sectionPresentation.badge}
++      description={
++        pairedPluginHost ? (
++          t(
++            'auto.components.settings.PluginsSettingsSection.catalogDescription',
++            'Find extensions in the official catalog and manage the plugins you’ve installed.'
++          )
++        ) : (
++          <PluginsSectionDescription text={sectionPresentation.description} />
++        )
++      }
++      hideHeader={showingDetail}
        bodyClassName="gap-6"
        headerAction={
 -        <PluginsHeaderActions
@@ -1448,23 +1582,8 @@ index 2516cca3..37a6bdc8 100644
 -          onSources={() => setSourcesOpen(true)}
 -          onDevelopment={() => setDevelopmentOpen(true)}
 -        />
-+        dataPluginMarketplace() ? (
-+          <div className="flex items-center gap-1.5">
-+            <PluginAddMenu disabled={!featureEnabled} onChoose={setInstallKind} />
-+            <Button
-+              variant="outline"
-+              size="sm"
-+              onClick={() =>
-+                void updateSettings({
-+                  pluginSystemEnabled: !featureEnabled
-+                }).catch(setPluginListError)
-+              }
-+            >
-+              {featureEnabled
-+                ? t('auto.components.settings.PluginsSettingsSection.turnOff', 'Turn off plugins')
-+                : t('auto.components.settings.PluginsSettingsSection.turnOn', 'Turn on plugins')}
-+            </Button>
-+          </div>
++        pairedPluginHost ? (
++          <PluginAddMenu disabled={!featureEnabled || systemBusy} onChoose={setInstallKind} />
 +        ) : (
 +          <PluginsHeaderActions
 +            featureEnabled={featureEnabled}
@@ -1481,7 +1600,30 @@ index 2516cca3..37a6bdc8 100644
 +        )
        }
      >
-       {featureEnabled && page.openKey !== null ? null : <PluginsAlphaNotice />}
+-      {featureEnabled && page.openKey !== null ? null : <PluginsAlphaNotice />}
++      {!showingDetail &&
++        (pairedPluginHost ? (
++          <SettingsGroup>
++            <SettingsRow
++              label={switchLabel}
++              htmlFor="plugin-system-enabled"
++              control={
++                <Switch
++                  id="plugin-system-enabled"
++                  checked={featureEnabled}
++                  pending={systemBusy ? 'saving' : undefined}
++                  aria-disabled={systemBusy || undefined}
++                  onCheckedChange={(enabled) => void setSystemEnabled(enabled)}
++                />
++              }
++            />
++          </SettingsGroup>
++        ) : (
++          <PluginsAlphaNotice />
++        ))}
+       <PluginSettingsOverview
+         featureEnabled={featureEnabled}
+         settingsError={settingsError}
 diff --git a/src/renderer/src/components/plugins/list/plugin-list-entries.ts b/src/renderer/src/components/plugins/list/plugin-list-entries.ts
 index 1f7a0b76..7c9e2ae7 100644
 --- a/src/renderer/src/components/plugins/list/plugin-list-entries.ts
@@ -1573,6 +1715,38 @@ index 248a397c..f89b534c 100644
        if (!mountedRef.current) {
          return
        }
+diff --git a/src/renderer/src/components/plugins/state/use-plugin-page-model.ts b/src/renderer/src/components/plugins/state/use-plugin-page-model.ts
+index 960c5653..f28e4dcf 100644
+--- a/src/renderer/src/components/plugins/state/use-plugin-page-model.ts
++++ b/src/renderer/src/components/plugins/state/use-plugin-page-model.ts
+@@ -1,4 +1,5 @@
+ import { useEffect, useState } from 'react'
++import { isWebClientLocation } from '@/app-shell/platform/web-client-location'
+ import type {
+   PluginMarketplaceHostInstallPreview,
+   PluginMarketplaceHostListing
+@@ -79,7 +80,7 @@ export function usePluginPageModel({
+   const [previewAttempt, setPreviewAttempt] = useState(0)
+ 
+   useEffect(() => {
+-    if (plugin || !listing) {
++    if (plugin || !listing || listing.hostUnavailableReason || listing.blockedByKillList) {
+       return
+     }
+     let stale = false
+@@ -181,9 +182,9 @@ export function usePluginPageModel({
+         ?.filter((item) => item.kind === 'customEditors')
+         .flatMap((item) => (item.detail ? item.detail.split(', ') : [])) ?? null)
+ 
+-  const images: PluginHostImages | undefined = servedPluginHostImages(
+-    plugin?.images ?? listing?.images ?? shownPreview?.images
+-  )
++  const images: PluginHostImages | undefined = isWebClientLocation()
++    ? undefined
++    : servedPluginHostImages(plugin?.images ?? listing?.images ?? shownPreview?.images)
+   return {
+     entry: shownEntry,
+     plugin,
 diff --git a/src/renderer/src/components/plugins/state/use-plugin-page-navigation.ts b/src/renderer/src/components/plugins/state/use-plugin-page-navigation.ts
 index 5cbedcb3..00663921 100644
 --- a/src/renderer/src/components/plugins/state/use-plugin-page-navigation.ts
@@ -1591,6 +1765,63 @@ index 5cbedcb3..00663921 100644
 -  return version
 +  return dataPluginMarketplace()?.hostVersion ?? version
  }
+diff --git a/src/renderer/src/components/plugins/state/use-plugin-settings-writes.ts b/src/renderer/src/components/plugins/state/use-plugin-settings-writes.ts
+index eeda7204..41d82b11 100644
+--- a/src/renderer/src/components/plugins/state/use-plugin-settings-writes.ts
++++ b/src/renderer/src/components/plugins/state/use-plugin-settings-writes.ts
+@@ -1,5 +1,5 @@
+ import { isPluginAutoUpdateOn } from '../../../../../shared/plugins/catalog/plugin-update-policy'
+-import { useCallback, useState, type MutableRefObject } from 'react'
++import { useCallback, useRef, useState, type MutableRefObject } from 'react'
+ import type { GlobalSettings } from '../../../../../shared/settings/global-settings-types'
+ import { translate } from '@/i18n/i18n'
+ 
+@@ -23,6 +23,8 @@ export function usePluginSettingsWrites({
+   rediscover: () => Promise<unknown>
+ }) {
+   const [devPathsBusy, setDevPathsBusy] = useState(false)
++  const savingSystem = useRef(false)
++  const [systemBusy, setSystemBusy] = useState(false)
+   const [settingsError, setSettingsError] = useState<string | null>(null)
+ 
+   const reset = useCallback(() => {
+@@ -49,6 +51,25 @@ export function usePluginSettingsWrites({
+     }
+   }
+ 
++  const setSystemEnabled = async (enabled: boolean): Promise<void> => {
++    if (savingSystem.current) {
++      return
++    }
++    savingSystem.current = true
++    setSystemBusy(true)
++    setSettingsError(null)
++    try {
++      await updateSettings({ pluginSystemEnabled: enabled })
++    } catch {
++      if (mountedRef.current) {
++        setSettingsError(saveFailed())
++      }
++    } finally {
++      savingSystem.current = false
++      setSystemBusy(false)
++    }
++  }
++
+   const toggleSuggestions = async (): Promise<void> => {
+     setSettingsError(null)
+     try {
+@@ -77,8 +98,10 @@ export function usePluginSettingsWrites({
+ 
+   return {
+     devPathsBusy,
++    systemBusy,
+     settingsError,
+     reset,
++    setSystemEnabled,
+     toggleSuggestions,
+     toggleAutoUpdate,
+     updateDevPaths
 diff --git a/src/renderer/src/components/settings/appearance/themes/use-catalog-app-themes.ts b/src/renderer/src/components/settings/appearance/themes/use-catalog-app-themes.ts
 index f0c29ff9..18c52341 100644
 --- a/src/renderer/src/components/settings/appearance/themes/use-catalog-app-themes.ts
@@ -1734,19 +1965,21 @@ index 3d163b2c..e3538b54 100644
        mounted={view.isSectionMounted('plugins')}
        settings={model.settings}
 diff --git a/src/renderer/src/i18n/locales/zh.json b/src/renderer/src/i18n/locales/zh.json
-index 95fc7d66..e45b990d 100644
+index 7fefdd68..6f99587f 100644
 --- a/src/renderer/src/i18n/locales/zh.json
 +++ b/src/renderer/src/i18n/locales/zh.json
-@@ -12152,6 +12152,8 @@
+@@ -12152,7 +12152,10 @@
            "descriptionVersion": "恢复到版本 {{value0}}"
          },
          "PluginsSettingsSection": {
 +          "turnOff": "关闭插件",
 +          "turnOn": "开启插件",
            "systemLabel": "插件系统",
++          "catalogDescription": "在官方目录发现插件，管理已安装的扩展。",
            "loading": "正在加载插件…",
            "noInstalledResultsTitle": "没有匹配的插件",
-@@ -13250,6 +13252,7 @@
+           "noInstalledResults": "没有已安装的插件匹配此搜索",
+@@ -13250,6 +13253,7 @@
            "showInstalled": "显示已安装的插件"
          },
          "PluginDetailPage": {
@@ -2266,10 +2499,10 @@ index 00000000..5fc6e283
 +  value: z.json()
 +})
 diff --git a/src/shared/rpc-contract/rpc-params-catalog.generated.ts b/src/shared/rpc-contract/rpc-params-catalog.generated.ts
-index 48224d3d..3465136f 100644
+index 2135e765..baf4f5ae 100644
 --- a/src/shared/rpc-contract/rpc-params-catalog.generated.ts
 +++ b/src/shared/rpc-contract/rpc-params-catalog.generated.ts
-@@ -681,6 +681,24 @@ import {
+@@ -682,6 +682,24 @@ import {
  } from './orchestration/orchestration-worker-release-schemas-params'
  import { WorkerStartParams } from './orchestration/orchestration-worker-start-params'
  import { WorkerDispatchParams as WorkerDispatchParamsOfOrchestrationWorkerStopParams } from './orchestration/orchestration-worker-stop-params'
@@ -2294,7 +2527,7 @@ index 48224d3d..3465136f 100644
  import {
    PluginCatalogAddParams,
    PluginCatalogRemoveParams,
-@@ -1434,6 +1452,42 @@ export const RPC_PARAMS_BY_METHOD = {
+@@ -1438,6 +1456,42 @@ export const RPC_PARAMS_BY_METHOD = {
    'connector.slackMirror.post': ConnectorSlackMirrorPost,
    'connector.slackMirror.set': ConnectorSlackMirrorSet,
    'connector.slackMirror.status': ConnectorSlackMirrorStatus,
