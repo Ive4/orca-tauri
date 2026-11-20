@@ -9,8 +9,8 @@
     "windows": [],
     "withGlobalTauri": false,
     "security": {
-      "capabilities": ["shell-deny-web-ipc"],
-      "csp": "default-src 'none'; style-src 'self'; img-src 'self'; frame-ancestors 'none'"
+      "capabilities": ["shell-deny-web-ipc", "tray-panel"],
+      "csp": "default-src 'none'; style-src 'self'; script-src 'self'; img-src 'self'; connect-src ipc: http://ipc.localhost; frame-ancestors 'none'"
     }
   },
   "bundle": {

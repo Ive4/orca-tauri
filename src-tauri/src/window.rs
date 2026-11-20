@@ -1,4 +1,4 @@
-use crate::desktop::AppState;
+use crate::{desktop::AppState, task_status::TaskTarget};
 use anyhow::{ensure, Context, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::{
@@ -30,6 +30,43 @@ pub fn current(app: &AppHandle) -> Option<Target> {
 /// Call from an async task, never directly from the tray/single-instance callback:
 /// WebView2's synchronous builder can deadlock inside native event handlers.
 pub async fn show(app: &AppHandle, state: &AppState, target: Target) -> Result<()> {
+    show_with_task(app, state, target, None).await
+}
+
+pub async fn show_task(app: &AppHandle, state: &AppState, task: &TaskTarget) -> Result<()> {
+    show_with_task(app, state, Target::Local, Some(task)).await
+}
+
+/// The download-time fast path may use a live window but can never replace one
+/// which was destroyed while waiting for the window lock.
+pub async fn reveal_existing_task(
+    app: &AppHandle,
+    state: &AppState,
+    task: &TaskTarget,
+) -> Result<()> {
+    let _guard = state.window_operation.lock().await;
+    if let Some(window) = app.get_webview_window(Target::Local.label()) {
+        window.unminimize()?;
+        window.set_focus()?;
+        window.eval(reveal_script(task)?)?;
+    }
+    Ok(())
+}
+
+fn reveal_script(task: &TaskTarget) -> Result<String> {
+    Ok(format!(
+        "window.__orcaTrayReveal?.({})",
+        serde_json::to_string(task)?
+    ))
+}
+
+async fn show_with_task(
+    app: &AppHandle,
+    state: &AppState,
+    target: Target,
+    task: Option<&TaskTarget>,
+) -> Result<()> {
+    let reveal = task.map(reveal_script).transpose()?;
     let _guard = state.window_operation.lock().await;
     if state.quitting.load(Ordering::SeqCst) {
         return Ok(());
@@ -38,6 +75,9 @@ pub async fn show(app: &AppHandle, state: &AppState, target: Target) -> Result<(
         window.unminimize()?;
         if window.is_visible()? {
             window.set_focus()?;
+        }
+        if let Some(script) = reveal {
+            window.eval(script)?;
         }
         return Ok(());
     }
@@ -69,7 +109,7 @@ pub async fn show(app: &AppHandle, state: &AppState, target: Target) -> Result<(
     let origin = url.origin();
     let startup_origin = origin.clone();
     let first_load = AtomicBool::new(true);
-    WebviewWindowBuilder::new(app, target.label(), WebviewUrl::External(url))
+    let builder = WebviewWindowBuilder::new(app, target.label(), WebviewUrl::External(url))
         .title(title)
         .inner_size(1280.0, 840.0)
         .min_inner_size(720.0, 480.0)
@@ -107,9 +147,18 @@ pub async fn show(app: &AppHandle, state: &AppState, target: Target) -> Result<(
         .on_new_window(|url, _features| {
             open_external(&url);
             NewWindowResponse::Deny
-        })
-        .build()
-        .context("create Orca webview window")?;
+        });
+    let builder = if target == Target::Local {
+        builder.initialization_script(include_str!("../../assets/tray-reveal.js"))
+    } else {
+        builder
+    };
+    let builder = if let Some(reveal) = reveal {
+        builder.initialization_script(reveal)
+    } else {
+        builder
+    };
+    builder.build().context("create Orca webview window")?;
     Ok(())
 }
 

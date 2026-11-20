@@ -1,5 +1,6 @@
 use anyhow::{ensure, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{path::Path, time::Duration};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
@@ -7,17 +8,43 @@ const METADATA_LIMIT: u64 = 16 * 1024;
 const RESPONSE_LIMIT: u64 = 8 * 1024 * 1024;
 const REQUEST_ID: &str = "tray-tasks";
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub(crate) struct TaskSummary {
-    pub terminals: u64,
-    pub unverified_terminals: u64,
-    pub working: usize,
-    pub monitoring: usize,
-    pub waiting: usize,
-    pub blocked: usize,
-    pub ended: usize,
-    pub unknown: usize,
+    pub rows: Vec<TaskRow>,
     pub partial: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TaskRow {
+    pub id: String,
+    pub title: String,
+    pub workspace: String,
+    pub provider: Option<String>,
+    pub status: TaskStatus,
+    pub started_at: Option<u64>,
+    pub updated_at: Option<u64>,
+    #[serde(skip)]
+    pub target: TaskTarget,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TaskTarget {
+    pub worktree_id: String,
+    pub tab_id: String,
+    pub leaf_id: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TaskStatus {
+    Waiting,
+    Blocked,
+    Working,
+    Monitoring,
+    Unknown,
+    Done,
 }
 
 #[derive(Deserialize)]
@@ -68,16 +95,25 @@ struct HostScope {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Worktree {
-    live_terminal_count: u32,
     #[serde(default)]
-    unverifiable_terminal_count: u32,
+    worktree_id: String,
+    display_name: Option<String>,
+    host_id: Option<String>,
     agents: Vec<Agent>,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Agent {
+    #[serde(default)]
+    pane_key: String,
     state: AgentState,
+    task_title: Option<String>,
+    conversation_name: Option<String>,
+    display_name: Option<String>,
+    agent_type: Option<String>,
+    state_started_at: Option<u64>,
+    updated_at: Option<u64>,
     working_mode: Option<String>,
     #[serde(default)]
     restored_unconfirmed: bool,
@@ -214,26 +250,112 @@ fn parse_response(bytes: &[u8], runtime_id: &str) -> Result<TaskSummary> {
         ..TaskSummary::default()
     };
     for worktree in listing.worktrees {
-        summary.terminals += u64::from(worktree.live_terminal_count);
-        summary.unverified_terminals += u64::from(worktree.unverifiable_terminal_count);
+        let workspace = label(worktree.display_name.as_deref()).unwrap_or_else(|| "工作区".into());
         for agent in worktree.agents {
-            if agent.restored_unconfirmed {
-                summary.unknown += 1;
-                continue;
-            }
-            match agent.state {
-                AgentState::Working if agent.working_mode.as_deref() == Some("monitoring") => {
-                    summary.monitoring += 1;
+            let status = if agent.restored_unconfirmed {
+                TaskStatus::Unknown
+            } else {
+                match agent.state {
+                    AgentState::Working if agent.working_mode.as_deref() == Some("monitoring") => {
+                        TaskStatus::Monitoring
+                    }
+                    AgentState::Working => TaskStatus::Working,
+                    AgentState::Waiting => TaskStatus::Waiting,
+                    AgentState::Blocked => TaskStatus::Blocked,
+                    AgentState::Done => TaskStatus::Done,
+                    AgentState::Unknown => TaskStatus::Unknown,
                 }
-                AgentState::Working => summary.working += 1,
-                AgentState::Waiting => summary.waiting += 1,
-                AgentState::Blocked => summary.blocked += 1,
-                AgentState::Done => summary.ended += 1,
-                AgentState::Unknown => summary.unknown += 1,
-            }
+            };
+            let title = [
+                agent.task_title,
+                agent.conversation_name,
+                agent.display_name,
+            ]
+            .iter()
+            .find_map(|candidate| label(candidate.as_deref()))
+            .unwrap_or_else(|| "未命名任务".into());
+            let (tab_id, leaf_id) = agent
+                .pane_key
+                .rsplit_once(':')
+                .map_or((agent.pane_key.as_str(), None), |(tab, leaf)| {
+                    (tab, Some(leaf.to_owned()))
+                });
+            let key =
+                serde_json::to_vec(&(&worktree.worktree_id, &worktree.host_id, &agent.pane_key))?;
+            let id = hex::encode(Sha256::digest(key));
+            summary.rows.push(TaskRow {
+                id,
+                title,
+                workspace: workspace.clone(),
+                provider: label(agent.agent_type.as_deref()),
+                status,
+                started_at: agent.state_started_at,
+                updated_at: agent.updated_at,
+                target: TaskTarget {
+                    worktree_id: worktree.worktree_id.clone(),
+                    tab_id: tab_id.to_owned(),
+                    leaf_id,
+                },
+            });
         }
     }
+    // Within each group, order by the start of the state, not ongoing output.
+    summary.rows.sort_by_key(|row| {
+        let group = match row.status {
+            TaskStatus::Waiting | TaskStatus::Blocked => 0,
+            TaskStatus::Done => 2,
+            _ => 1,
+        };
+        (group, std::cmp::Reverse(row.started_at.or(row.updated_at)))
+    });
     Ok(summary)
+}
+
+fn label(value: Option<&str>) -> Option<String> {
+    let value = value?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    // The browser offer may contain another URL encoded inside a fragment.
+    // Check the original and each decoded layer before clipping display text.
+    let mut decoded = value.to_ascii_lowercase();
+    for _ in 0..4 {
+        if [
+            "pairing=",
+            "orca-pair:",
+            "orcapair:",
+            "orca://",
+            "bearertoken",
+        ]
+        .iter()
+        .any(|needle| decoded.contains(needle))
+        {
+            return None;
+        }
+        if !decoded.contains('%') {
+            break;
+        }
+        let next = url::form_urlencoded::parse(decoded.as_bytes())
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>()
+            .join("&")
+            .to_ascii_lowercase();
+        if next == decoded || next.strip_suffix('=') == Some(decoded.as_str()) {
+            break;
+        }
+        decoded = next;
+    }
+    if decoded.contains("%25") || decoded.contains("orca://") || decoded.contains("pairing=") {
+        return None;
+    }
+    let mut chars = value
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch });
+    let mut title: String = chars.by_ref().take(120).collect();
+    if chars.next().is_some() {
+        title.push('…');
+    }
+    Some(title)
 }
 
 #[cfg(test)]
@@ -256,17 +378,44 @@ mod tests {
             ]}]}
         }"#;
         let summary = parse_response(response, "rt_test").unwrap();
-        assert_eq!(summary.terminals, 2);
-        assert_eq!(summary.unverified_terminals, 1);
-        assert_eq!(summary.working, 1);
-        assert_eq!(summary.monitoring, 1);
-        assert_eq!(summary.waiting, 1);
-        assert_eq!(summary.blocked, 1);
-        assert_eq!(summary.ended, 1);
-        assert_eq!(summary.unknown, 2);
+        let status = |status| {
+            summary
+                .rows
+                .iter()
+                .filter(|row| row.status == status)
+                .count()
+        };
+        assert_eq!(status(TaskStatus::Working), 1);
+        assert_eq!(status(TaskStatus::Monitoring), 1);
+        assert_eq!(status(TaskStatus::Waiting), 1);
+        assert_eq!(status(TaskStatus::Blocked), 1);
+        assert_eq!(status(TaskStatus::Done), 1);
+        assert_eq!(status(TaskStatus::Unknown), 2);
         assert!(!summary.partial);
         assert!(parse_response(response, "rt_other").is_err());
         assert!(parse_response(br#"{"id":"tray-tasks","ok":false}"#, "rt_test").is_err());
+    }
+
+    #[test]
+    fn popup_projects_sanitized_rows_without_prompts_or_pairing_credentials() {
+        let response = br#"{
+          "id":"tray-tasks","ok":true,"_meta":{"runtimeId":"rt_test"},
+          "result":{"truncated":false,"totalCount":1,
+            "worktrees":[{"worktreeId":"ws-id","displayName":"Build","liveTerminalCount":2,"agents":[
+              {"paneKey":"tab:leaf","state":"working","taskTitle":"Build task","agentType":"codex","stateStartedAt":100},
+              {"paneKey":"tab2:leaf","state":"waiting","conversationName":"orca%253A%252F%252Fpair%253Fcode%253Dsecret","displayName":"Review","prompt":"never shown"}
+            ]}]}
+        }"#;
+        let summary = parse_response(response, "rt_test").unwrap();
+        assert_eq!(summary.rows[0].title, "Review");
+        assert_eq!(summary.rows[0].status, TaskStatus::Waiting);
+        assert_eq!(summary.rows[1].title, "Build task");
+        assert_eq!(summary.rows[1].target.tab_id, "tab");
+        assert_eq!(summary.rows[1].workspace, "Build");
+        let payload = serde_json::to_string(&summary).unwrap();
+        for private in ["secret", "never shown", "ws-id", "tab:leaf"] {
+            assert!(!payload.contains(private));
+        }
     }
 
     #[tokio::test]

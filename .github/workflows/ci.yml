@@ -61,6 +61,7 @@ jobs:
           node-version: '22'
       - run: node scripts/test-pairing-init.mjs
       - run: node scripts/test-bots-i18n.mjs
+      - run: node scripts/test-tray-reveal.mjs
       - name: Parse PowerShell scripts without downloading upstream binaries
         shell: pwsh
         run: |

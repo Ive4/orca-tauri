@@ -1,0 +1,8 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "tray-panel",
+  "description": "Only the bundled tray panel can read task summaries and dispatch its own controls.",
+  "local": true,
+  "windows": ["tray-panel"],
+  "permissions": ["allow-tray-panel"]
+}

@@ -102,7 +102,7 @@ jobs:
           bundle = {'resources': {f'../dist-core/{f}': f for f in ('bootstrap-core.zip', 'bootstrap-core.json')}}
           config = {'bundle': bundle}
           if os.environ['RUNNER_OS'] == 'macOS':
-              bundle['macOS'] = {'minimumSystemVersion': '13.5', 'signingIdentity': '-'}
+              bundle['macOS'] = {'minimumSystemVersion': '13.5'}
           if os.environ['GITHUB_EVENT_NAME'] == 'push':
               key = os.environ['UPDATER_PUBLIC_KEY'].strip()
               if not key:
@@ -119,12 +119,25 @@ jobs:
       - name: Build installer and sign tagged update bundle
         shell: bash
         env:
+          APPLE_CERTIFICATE: ${{ runner.os == 'macOS' && secrets.APPLE_CERTIFICATE || '' }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ runner.os == 'macOS' && secrets.APPLE_CERTIFICATE_PASSWORD || '' }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ github.event_name == 'push' && secrets.TAURI_SIGNING_PRIVATE_KEY || '' }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ github.event_name == 'push' && secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD || '' }}
         run: |
           if [[ "$GITHUB_EVENT_NAME" == push && -z "$TAURI_SIGNING_PRIVATE_KEY" ]]; then
             echo 'Set the TAURI_SIGNING_PRIVATE_KEY repository secret.' >&2
             exit 1
+          fi
+          if [[ "$RUNNER_OS" == macOS && "$GITHUB_EVENT_NAME" == push && -z "$APPLE_CERTIFICATE" ]]; then
+            echo 'Set APPLE_CERTIFICATE and APPLE_CERTIFICATE_PASSWORD to retain Keychain access across tagged macOS releases.' >&2
+            exit 1
+          fi
+          # Tauri treats the presence of these variables as opt-in to certificate signing.
+          if [[ -z "$APPLE_CERTIFICATE" ]]; then
+            unset APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD
+            if [[ "$RUNNER_OS" == macOS ]]; then
+              export APPLE_SIGNING_IDENTITY=-
+            fi
           fi
           npm exec --yes --package=@tauri-apps/cli@2.12.6 -- tauri build \
             --target "$TARGET" --bundles "$BUNDLE" --config src-tauri/release-config.json -- --locked

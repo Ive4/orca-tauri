@@ -1,9 +1,9 @@
 use crate::{
     config::{AppPaths, Config},
     process::{CoreManager, CorePhase},
-    task_status::{self, TaskSummary},
+    task_status::{self, TaskSummary, TaskTarget},
     tray,
-    updater::{CoreUpdater, InstalledCore},
+    updater::{CoreRelease, CoreUpdater, InstalledCore},
     window,
 };
 use anyhow::{bail, ensure, Context, Result};
@@ -20,7 +20,7 @@ use tauri::{AppHandle, Manager, RunEvent};
 use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 use tauri_plugin_notification::NotificationExt;
-use tauri_plugin_updater::UpdaterExt;
+use tauri_plugin_updater::{Update, UpdaterExt};
 
 pub struct AppState {
     config: RwLock<Config>,
@@ -35,12 +35,15 @@ pub struct AppState {
     message: Mutex<String>,
     latest_official_version: Mutex<Option<Version>>,
     tasks: Mutex<Option<TaskSnapshot>>,
+    retry_tasks: tokio::sync::Notify,
+    core_update: Mutex<Option<CoreRelease>>,
+    app_update: Mutex<Option<Update>>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct TaskSnapshot {
     pid: u32,
-    pub summary: Option<TaskSummary>,
+    pub summary: Option<Arc<TaskSummary>>,
 }
 
 impl AppState {
@@ -70,7 +73,31 @@ impl AppState {
         self.tasks
             .lock()
             .ok()?
+            .as_ref()
             .filter(|snapshot| snapshot.pid == pid)
+            .cloned()
+    }
+
+    pub(crate) fn retry_tasks(&self) {
+        if self.core.status().phase == CorePhase::Running {
+            if let Ok(mut snapshot) = self.tasks.lock() {
+                *snapshot = None;
+            }
+            self.retry_tasks.notify_one();
+        }
+    }
+
+    pub(crate) fn available_updates(&self) -> (Option<String>, Option<String>) {
+        (
+            self.app_update
+                .lock()
+                .ok()
+                .and_then(|update| update.as_ref().map(|update| update.version.clone())),
+            self.core_update
+                .lock()
+                .ok()
+                .and_then(|release| release.as_ref().map(CoreRelease::display_version)),
+        )
     }
 
     pub fn is_busy(&self) -> bool {
@@ -82,15 +109,18 @@ impl AppState {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub enum Action {
     Show,
     ShowPaired,
+    ShowTask(TaskTarget),
     Toggle,
     Destroy,
     Restart,
     Stop,
     CheckOfficialVersion,
+    CheckCoreUpdate,
+    CheckAppUpdate,
     Update,
     UpdateApp,
     Rollback,
@@ -112,12 +142,17 @@ pub fn request(app: &AppHandle, action: Action) {
     let existing = window::current(app).is_some();
     if matches!(action, Action::Destroy)
         || (existing && matches!(action, Action::Toggle | Action::Show | Action::ShowPaired))
+        || (matches!(window::current(app), Some(window::Target::Local))
+            && matches!(&action, Action::ShowTask(_)))
     {
         let app = app.clone();
         tauri::async_runtime::spawn(async move {
             let result = match action {
                 Action::Show => window::show(&app, &state, window::Target::Local).await,
                 Action::ShowPaired => window::show(&app, &state, window::Target::Paired).await,
+                Action::ShowTask(ref target) => {
+                    window::reveal_existing_task(&app, &state, target).await
+                }
                 _ => window::destroy(&app, &state).await,
             };
             if let Err(error) = result {
@@ -136,13 +171,17 @@ pub fn request(app: &AppHandle, action: Action) {
     state.set_message(
         app,
         match action {
-            Action::Show | Action::ShowPaired | Action::Toggle => "正在打开窗口…",
+            Action::Show | Action::ShowPaired | Action::ShowTask(_) | Action::Toggle => {
+                "正在打开窗口…"
+            }
             Action::Destroy => "正在关闭窗口…",
             Action::Restart => "正在重启内核…",
             Action::Stop => "正在停止内核及其任务…",
             Action::CheckOfficialVersion => "正在查询 Orca 官方版本…",
-            Action::Update => "正在检查内核更新…",
-            Action::UpdateApp => "正在检查应用更新…",
+            Action::CheckCoreUpdate => "正在检查内核更新…",
+            Action::Update => "正在准备内核更新…",
+            Action::CheckAppUpdate => "正在检查应用更新…",
+            Action::UpdateApp => "正在准备应用更新…",
             Action::Rollback => "正在回退内核…",
             Action::Autostart => "正在修改开机启动设置…",
         },
@@ -178,6 +217,10 @@ async fn execute(app: &AppHandle, state: &AppState, action: Action) -> Result<()
             ensure_started(app, state).await?;
             window::show(app, state, window::Target::Paired).await?;
         }
+        Action::ShowTask(ref target) => {
+            ensure_started(app, state).await?;
+            window::show_task(app, state, target).await?;
+        }
         Action::Toggle => {
             if window::current(app).is_some() {
                 window::destroy(app, state).await?;
@@ -210,6 +253,8 @@ async fn execute(app: &AppHandle, state: &AppState, action: Action) -> Result<()
                 .map_err(|_| anyhow::anyhow!("official version lock poisoned"))? = Some(latest);
             state.set_message(app, "官方版本查询完成");
         }
+        Action::CheckCoreUpdate => check_core_update(app, state).await?,
+        Action::CheckAppUpdate => check_app_update(app, state).await?,
         Action::Update => update(app, state).await?,
         Action::UpdateApp => update_app(app, state).await?,
         Action::Rollback => {
@@ -253,7 +298,9 @@ async fn execute(app: &AppHandle, state: &AppState, action: Action) -> Result<()
         }
     }
     match action {
-        Action::Show | Action::ShowPaired => state.set_message(app, "窗口已打开"),
+        Action::Show | Action::ShowPaired | Action::ShowTask(_) => {
+            state.set_message(app, "窗口已打开")
+        }
         Action::Destroy => state.set_message(app, "窗口已关闭"),
         Action::Toggle => state.set_message(
             app,
@@ -279,7 +326,7 @@ async fn ensure_started(app: &AppHandle, state: &AppState) -> Result<()> {
         start_core(state, &installed).await?;
     } else {
         let archive = bundled_core_archive(app).context(
-            "尚未安装内核：设置 config.json 的 update_repository，然后使用托盘“设置 → 关于与更新 → 检查并更新内核”",
+            "尚未安装内核：设置 config.json 的 update_repository，然后使用托盘“设置 → 关于与更新 → 检查内核更新”",
         )?;
         install_bundled_core(app, state, &archive).await?;
     }
@@ -292,20 +339,24 @@ fn bundled_core_archive(app: &AppHandle) -> Option<std::path::PathBuf> {
     archive.is_file().then_some(archive)
 }
 
-async fn install_bundled_core(app: &AppHandle, state: &AppState, archive: &Path) -> Result<()> {
-    #[derive(serde::Deserialize)]
-    struct Seed {
-        version: String,
-        sha256: String,
-        package_revision: Option<String>,
-        target: Option<String>,
-    }
+#[derive(serde::Deserialize)]
+struct BundledCoreIdentity {
+    version: String,
+    sha256: String,
+    package_revision: Option<String>,
+    target: Option<String>,
+}
 
-    state.set_message(app, "正在校验随附内核…");
+async fn bundled_core_identity(archive: &Path) -> Result<BundledCoreIdentity> {
     let identity = tokio::fs::read(archive.with_extension("json"))
         .await
         .context("read bundled core identity")?;
-    let seed: Seed = serde_json::from_slice(&identity).context("parse bundled core identity")?;
+    serde_json::from_slice(&identity).context("parse bundled core identity")
+}
+
+async fn install_bundled_core(app: &AppHandle, state: &AppState, archive: &Path) -> Result<()> {
+    state.set_message(app, "正在校验随附内核…");
+    let seed = bundled_core_identity(archive).await?;
     let session = state.updater.begin_update().await;
     let core = session
         .prepare_local_archive(archive, &seed.version, &seed.sha256)
@@ -353,8 +404,8 @@ fn activate_started_core(state: &AppState, commit: impl FnOnce() -> Result<()>) 
     commit()
 }
 
-async fn update(app: &AppHandle, state: &AppState) -> Result<()> {
-    state.set_message(app, "正在检查内核更新…");
+async fn check_core_update(app: &AppHandle, state: &AppState) -> Result<()> {
+    *state.core_update.lock().unwrap() = None;
     let session = state.updater.begin_update().await;
     let release = session
         .latest_release()
@@ -362,8 +413,27 @@ async fn update(app: &AppHandle, state: &AppState) -> Result<()> {
         .context("仓库中没有适用于当前平台的稳定内核包")?;
     if let Some(current) = state.updater.load_active()? {
         if !release.is_newer_than(&current.manifest)? {
-            state.set_message(app, "已安装最新内核");
-            notify(app, state, "内核已经是最新版本");
+            state.set_message(app, "当前内核已是最新版本");
+            return Ok(());
+        }
+    }
+    let version = release.display_version();
+    *state.core_update.lock().unwrap() = Some(release);
+    state.set_message(app, format!("发现内核更新 · {version}"));
+    Ok(())
+}
+
+async fn update(app: &AppHandle, state: &AppState) -> Result<()> {
+    let release = state
+        .core_update
+        .lock()
+        .unwrap()
+        .take()
+        .context("请先检查内核更新")?;
+    let session = state.updater.begin_update().await;
+    if let Some(current) = state.updater.load_active()? {
+        if !release.is_newer_than(&current.manifest)? {
+            state.set_message(app, "当前内核已是最新版本");
             return Ok(());
         }
     }
@@ -381,8 +451,8 @@ async fn update(app: &AppHandle, state: &AppState) -> Result<()> {
     Ok(())
 }
 
-async fn update_app(app: &AppHandle, state: &AppState) -> Result<()> {
-    state.set_message(app, "正在检查应用更新…");
+async fn check_app_update(app: &AppHandle, state: &AppState) -> Result<()> {
+    *state.app_update.lock().unwrap() = None;
     let mut updater = app.updater_builder().timeout(Duration::from_secs(180));
     #[cfg(windows)]
     {
@@ -394,14 +464,26 @@ async fn update_app(app: &AppHandle, state: &AppState) -> Result<()> {
         updater = updater.proxy(proxy.parse()?);
     }
     let Some(update) = updater.build()?.check().await? else {
-        state.set_message(app, "已安装最新应用");
-        notify(app, state, "应用已经是最新版本");
+        state.set_message(app, "当前应用已是最新版本");
         return Ok(());
     };
     ensure!(
         update.download_url.scheme() == "https",
         "应用更新下载必须使用 HTTPS"
     );
+    let version = update.version.clone();
+    *state.app_update.lock().unwrap() = Some(update);
+    state.set_message(app, format!("发现应用更新 · {version}"));
+    Ok(())
+}
+
+async fn update_app(app: &AppHandle, state: &AppState) -> Result<()> {
+    let update = state
+        .app_update
+        .lock()
+        .unwrap()
+        .take()
+        .context("请先检查应用更新")?;
     state.set_message(app, format!("正在下载并验证应用 {}…", update.version));
     let mut downloaded = 0u64;
     let mut displayed_mib = 0u64;
@@ -565,7 +647,7 @@ fn report(app: &AppHandle, state: &AppState, error: anyhow::Error) {
     notify(
         app,
         state,
-        &format!("{}。可从托盘“设置 → 打开日志目录”查看详情。", error),
+        &format!("{}。可从托盘“设置 → 高级 → 打开日志目录”查看详情。", error),
     );
 }
 
@@ -604,10 +686,17 @@ pub fn run() -> Result<()> {
         message: Mutex::new("内核未启动".into()),
         latest_official_version: Mutex::new(None),
         tasks: Mutex::new(None),
+        retry_tasks: tokio::sync::Notify::new(),
+        core_update: Mutex::new(None),
+        app_update: Mutex::new(None),
     });
     let setup_state = state.clone();
     let context = tauri::generate_context!();
     let builder = tauri::Builder::default()
+        .invoke_handler(tauri::generate_handler![
+            tray::tray_state,
+            tray::tray_action
+        ])
         // This plugin must precede all other plugins and runtime creation.
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             request(app, Action::Show)
@@ -713,15 +802,14 @@ pub fn run() -> Result<()> {
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 let mut last_poll = None::<(u32, tokio::time::Instant)>;
                 loop {
-                    interval.tick().await;
+                    let retry = tokio::select! {
+                        _ = interval.tick() => false,
+                        _ = monitor_state.retry_tasks.notified() => true,
+                    };
                     if monitor_state.quitting.load(Ordering::SeqCst) {
                         continue;
                     }
                     let status = monitor_state.core.status();
-                    if status.phase == CorePhase::Failed && !monitor_state.is_busy() {
-                        monitor_state
-                            .set_message(&monitor_handle, "内核意外退出；请查看日志并重启");
-                    }
                     tray::refresh(&monitor_handle, &monitor_state);
                     if status.phase != CorePhase::Running {
                         last_poll = None;
@@ -731,15 +819,18 @@ pub fn run() -> Result<()> {
                         continue;
                     }
                     let Some(pid) = status.pid else { continue };
-                    if last_poll.is_some_and(|(previous, at)| {
-                        previous == pid && at.elapsed() < Duration::from_secs(5)
-                    }) {
+                    if !retry
+                        && last_poll.is_some_and(|(previous, at)| {
+                            previous == pid && at.elapsed() < Duration::from_secs(5)
+                        })
+                    {
                         continue;
                     }
                     last_poll = Some((pid, tokio::time::Instant::now()));
                     let summary = task_status::read_owned(&monitor_state.paths.runtime_data, pid)
                         .await
-                        .ok();
+                        .ok()
+                        .map(Arc::new);
                     let current = monitor_state.core.status();
                     if current.phase != CorePhase::Running || current.pid != Some(pid) {
                         continue;

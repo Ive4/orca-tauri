@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "allow-tray-panel"
+description = "Read and operate the bundled task panel."
+commands.allow = ["tray_state", "tray_action"]
