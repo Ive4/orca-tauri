@@ -1,0 +1,30 @@
+{
+  "verified_on": "2026-11-20",
+  "execution_platform": "Linux x86_64",
+  "rust": "1.100.0",
+  "tauri": "2.12.7",
+  "core_tests": {
+    "passed": 22,
+    "failed": 0,
+    "ignored": 1,
+    "ignored_reason": "subprocess fixture explicitly invoked by lifecycle tests"
+  },
+  "pairing_tests": {
+    "passed": 18,
+    "failed": 0
+  },
+  "core_clippy": "passed -D warnings",
+  "desktop_check": "passed on Linux, all targets",
+  "desktop_clippy": "passed on Linux, all targets, -D warnings",
+  "rustfmt": "passed",
+  "windows_process_module_type_check": "passed including Windows tests",
+  "powershell_parser": "2 scripts passed",
+  "workflow_yaml": "4 parsed",
+  "workflow_embedded_javascript": "2 async function bodies parsed",
+  "csharp_pinvoke_helper_compile": "passed Add-Type on Linux",
+  "windows_runtime_tested": false,
+  "windows_webview2_tested": false,
+  "macos_build_tested": false,
+  "memory_measured": false,
+  "upstream_installer": "v1.4.264, actual bytes and extracted files verified; see installer-audit.json"
+}

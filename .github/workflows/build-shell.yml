@@ -1,0 +1,244 @@
+name: Build and release Orca-Tauri
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: shell-build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      app: ${{ steps.version.outputs.app }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - id: version
+        name: Verify application version and tag
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, re, tomllib
+          app = tomllib.loads(pathlib.Path('src-tauri/Cargo.toml').read_text())['package']['version']
+          tauri = json.loads(pathlib.Path('src-tauri/tauri.conf.json').read_text())
+          if 'version' in tauri or not re.fullmatch(r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', app):
+              raise SystemExit('Set the stable application version only in src-tauri/Cargo.toml.')
+          if os.environ['GITHUB_EVENT_NAME'] == 'push' and os.environ['GITHUB_REF_NAME'] != f'v{app}':
+              raise SystemExit(f'Expected tag v{app}.')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              print(f'app={app}', file=output)
+          PY
+
+  build:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            target: aarch64-apple-darwin
+            platform: darwin-aarch64
+            bundle: app
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+            platform: windows-x86_64
+            bundle: nsis
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      ORCA_TAURI_REPOSITORY: ${{ github.repository }}
+      APP_VERSION: ${{ needs.version.outputs.app }}
+      TARGET: ${{ matrix.target }}
+      PLATFORM: ${{ matrix.platform }}
+      BUNDLE: ${{ matrix.bundle }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: cargo test --locked --no-default-features
+      - run: node scripts/test-pairing-init.mjs
+      - name: Download and qualify macOS Bun core
+        if: runner.os == 'macOS'
+        run: python3 scripts/extract-macos-core.py --download-orca --output dist-core
+      - name: Extract and qualify Windows Node core
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          ./scripts/extract-headless.ps1 -OutputDirectory ./dist-core
+          $lock = Get-Content core-version.json -Raw | ConvertFrom-Json
+          $version = "$($lock.package_revision)-$($lock.version.Substring(1))"
+          $archive = "dist-core/orca-core-v$version-$($lock.target).zip"
+          Move-Item -LiteralPath $archive -Destination dist-core/bootstrap-core.zip
+          $digest = (Get-FileHash dist-core/bootstrap-core.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          @{ version = $lock.version; package_revision = $lock.package_revision; target = $lock.target; sha256 = $digest } |
+            ConvertTo-Json | Set-Content dist-core/bootstrap-core.json -Encoding utf8NoBOM
+      - name: Set bundle and updater configuration
+        shell: bash
+        env:
+          UPDATER_PUBLIC_KEY: ${{ vars.TAURI_UPDATER_PUBLIC_KEY }}
+        run: |
+          python - <<'PY'
+          import json, os, pathlib
+          bundle = {'resources': {f'../dist-core/{f}': f for f in ('bootstrap-core.zip', 'bootstrap-core.json')}}
+          config = {'bundle': bundle}
+          if os.environ['RUNNER_OS'] == 'macOS':
+              bundle['macOS'] = {'minimumSystemVersion': '13.5', 'signingIdentity': '-'}
+          if os.environ['GITHUB_EVENT_NAME'] == 'push':
+              key = os.environ['UPDATER_PUBLIC_KEY'].strip()
+              if not key:
+                  raise SystemExit('Set the TAURI_UPDATER_PUBLIC_KEY repository variable.')
+              bundle['createUpdaterArtifacts'] = True
+              repo = os.environ['GITHUB_REPOSITORY']
+              config['plugins'] = {'updater': {
+                  'pubkey': key,
+                  'requireSignedVersion': True,
+                  'endpoints': [f'https://github.com/{repo}/releases/latest/download/latest.json'],
+              }}
+          pathlib.Path('src-tauri/release-config.json').write_text(json.dumps(config), encoding='utf-8')
+          PY
+      - name: Build installer and sign tagged update bundle
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ github.event_name == 'push' && secrets.TAURI_SIGNING_PRIVATE_KEY || '' }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ github.event_name == 'push' && secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD || '' }}
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == push && -z "$TAURI_SIGNING_PRIVATE_KEY" ]]; then
+            echo 'Set the TAURI_SIGNING_PRIVATE_KEY repository secret.' >&2
+            exit 1
+          fi
+          npm exec --yes --package=@tauri-apps/cli@2.12.6 -- tauri build \
+            --target "$TARGET" --bundles "$BUNDLE" --config src-tauri/release-config.json -- --locked
+      - name: Collect macOS app and update archive
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          dir="target/$TARGET/release/bundle/macos"
+          mkdir -p release
+          ditto -c -k --sequesterRsrc --keepParent "$dir/Orca-Tauri.app" \
+            "release/Orca-Tauri-${APP_VERSION}-macos-arm64.zip"
+          if [[ "$GITHUB_EVENT_NAME" == push ]]; then
+            for suffix in .tar.gz .tar.gz.sig; do
+              cp "$dir/Orca-Tauri.app$suffix" "release/Orca-Tauri-${APP_VERSION}-macos-arm64.app$suffix"
+            done
+          fi
+      - name: Collect Windows NSIS installer and signature
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $dir = "target/$env:TARGET/release/bundle/nsis"
+          $installer = @(Get-ChildItem -LiteralPath $dir -File -Filter '*.exe')
+          if ($installer.Count -ne 1) { throw 'Expected one NSIS installer.' }
+          New-Item -ItemType Directory -Path release -Force | Out-Null
+          $name = "release/Orca-Tauri-${env:APP_VERSION}-windows-x64-setup.exe"
+          Copy-Item -LiteralPath $installer[0].FullName -Destination $name
+          if ($env:GITHUB_EVENT_NAME -eq 'push') {
+            Copy-Item -LiteralPath "$($installer[0].FullName).sig" -Destination "$name.sig"
+          }
+      - name: Record installer and bundled Core versions
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          app = os.environ['APP_VERSION']
+          platform = os.environ['PLATFORM']
+          target = os.environ['TARGET']
+          seed = json.loads(Path('dist-core/bootstrap-core.json').read_text())
+          if seed['target'] != target:
+              raise SystemExit('The bundled Core does not match the installer target.')
+          core = f"{seed['package_revision']}-{seed['version'].removeprefix('v')}"
+          stem = f'Orca-Tauri-{app}'
+          suffix = {'darwin-aarch64': 'macos-arm64.zip', 'windows-x86_64': 'windows-x64-setup.exe'}[platform]
+          installer = f'{stem}-{suffix}'
+          if not (Path('release') / installer).is_file():
+              raise SystemExit(f'Missing installer {installer}')
+          info = {'version': app, 'platform': platform, 'target': target,
+                  'core_version': core, 'ui_version': core, 'installer': installer}
+          Path(f'release/{stem}-{platform}.json').write_text(json.dumps(info, indent=2) + '\n')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shell-${{ matrix.platform }}-v${{ needs.version.outputs.app }}
+          path: release/*
+          if-no-files-found: error
+
+  publish:
+    if: github.event_name == 'push'
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    concurrency:
+      group: orca-tauri-release-publication
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      APP_VERSION: ${{ needs.version.outputs.app }}
+      UPDATER_PUBLIC_KEY: ${{ vars.TAURI_UPDATER_PUBLIC_KEY }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: shell-*
+          path: release
+          merge-multiple: true
+      - name: Generate update manifest and publish both platforms
+        run: |
+          CURRENT_RELEASE_TAG="$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 \
+            --exclude-drafts --exclude-pre-releases --json tagName,isLatest \
+            --jq '.[] | select(.isLatest) | .tagName')"
+          export CURRENT_RELEASE_TAG
+          cd release
+          python3 - <<'PY'
+          import base64, json, os, re
+          from pathlib import Path
+          version = os.environ['APP_VERSION']
+          previous = re.fullmatch(r'v(\d+)\.(\d+)\.(\d+)', os.environ['CURRENT_RELEASE_TAG'])
+          if previous and tuple(map(int, previous.groups())) >= tuple(map(int, version.split('.'))):
+              raise SystemExit(f'The latest application release is already {previous[0]}.')
+          url = f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/releases/download/v{version}"
+          key_box = base64.b64decode(os.environ['UPDATER_PUBLIC_KEY'].strip(), validate=True).splitlines()
+          key_id = base64.b64decode(key_box[1], validate=True)[2:10]
+          platforms = {}
+          for platform, suffix in {'darwin-aarch64': 'macos-arm64.app.tar.gz',
+                                   'windows-x86_64': 'windows-x64-setup.exe'}.items():
+              file = Path(f'Orca-Tauri-{version}-{suffix}')
+              if not file.is_file() or not file.stat().st_size:
+                  raise SystemExit(f'Missing update payload {file}')
+              signature = file.with_name(f'{file.name}.sig').read_text().strip()
+              signature_box = base64.b64decode(signature, validate=True).splitlines()
+              if base64.b64decode(signature_box[1], validate=True)[2:10] != key_id:
+                  raise SystemExit(f'Signature key disagrees with the configured public key: {file}')
+              if f'version:{version}' not in signature_box[2].decode().split('\t'):
+                  raise SystemExit(f'Signature does not declare version {version}: {file}')
+              info = json.loads(Path(f'Orca-Tauri-{version}-{platform}.json').read_text())
+              if (info['version'], info['platform']) != (version, platform) or not Path(info['installer']).stat().st_size:
+                  raise SystemExit(f'Installer metadata mismatch for {platform}.')
+              platforms[platform] = {'signature': signature, 'url': f'{url}/{file.name}',
+                                     'core_version': info['core_version'], 'ui_version': info['ui_version'],
+                                     'installer_url': f"{url}/{info['installer']}"}
+          Path('latest.json').write_text(json.dumps({'version': version, 'platforms': platforms}, indent=2) + '\n')
+          PY
+          sha256sum Orca-Tauri-* latest.json > SHA256SUMS.txt
+          gh release create "$GITHUB_REF_NAME" Orca-Tauri-* latest.json SHA256SUMS.txt \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --latest \
+            --title "Orca-Tauri $GITHUB_REF_NAME" --generate-notes

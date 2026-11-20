@@ -1,0 +1,195 @@
+name: Qualify and release headless core
+
+on:
+  pull_request:
+    paths:
+      - core-version.json
+      - core-version.macos-arm64.json
+      - scripts/extract-headless.ps1
+      - scripts/verify-core.ps1
+      - scripts/extract-macos-core.py
+      - scripts/macos-data-plugins.patch
+      - scripts/verify-bun-macos.py
+      - .github/workflows/release-core.yml
+  push:
+    branches: [main]
+    paths:
+      - core-version.json
+      - core-version.macos-arm64.json
+      - scripts/extract-headless.ps1
+      - scripts/verify-core.ps1
+      - scripts/extract-macos-core.py
+      - scripts/macos-data-plugins.patch
+      - scripts/verify-bun-macos.py
+      - .github/workflows/release-core.yml
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Publish after qualification (only allowed from main)'
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: core-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  qualify:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    outputs:
+      version: ${{ steps.identity.outputs.version }}
+      revision: ${{ steps.identity.outputs.revision }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Read pinned identity
+        id: identity
+        shell: pwsh
+        run: |
+          $lock = Get-Content core-version.json -Raw | ConvertFrom-Json
+          $stable = '(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'
+          if ($lock.version -cnotmatch "^v$stable$" -or $lock.package_revision -cnotmatch "^$stable$" -or $lock.package_revision -eq '0.0.0') { throw 'Invalid core package version.' }
+          "version=$($lock.version)" >> $env:GITHUB_OUTPUT
+          "revision=$($lock.package_revision)" >> $env:GITHUB_OUTPUT
+      - name: Extract and qualify the exact upstream bytes
+        shell: pwsh
+        run: ./scripts/extract-headless.ps1 -OutputDirectory ./dist-core
+      - name: Retain qualified package and sanitized evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: qualified-windows-core
+          path: dist-core/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    needs: qualify
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' ||
+       (github.event_name == 'workflow_dispatch' && inputs.publish == true))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: qualified-windows-core
+          path: dist-core
+      - name: Publish complete core release without replacing existing bytes
+        uses: actions/github-script@v7
+        env:
+          CORE_VERSION: ${{ needs.qualify.outputs.version }}
+          CORE_REVISION: ${{ needs.qualify.outputs.revision }}
+        with:
+          script: |
+            const fs=require('node:fs'), crypto=require('node:crypto');
+            const {owner,repo}=context.repo;
+            const version=process.env.CORE_VERSION;
+            const revision=process.env.CORE_REVISION;
+            const packageVersion=`${revision}-${version.slice(1)}`;
+            const target='x86_64-pc-windows-msvc';
+            const tag=`core-windows-v${packageVersion}`;
+            const stem=`orca-core-v${packageVersion}-${target}`;
+            const filenames=[`${stem}.zip`,`${stem}.zip.sha256`,`${stem}-validation.json`];
+            const files=filenames.map(name=>({name,bytes:fs.readFileSync(`dist-core/${name}`)}));
+            const hash=bytes=>crypto.createHash('sha256').update(bytes).digest('hex');
+            if(files[1].bytes.toString('utf8').trim()!==`${hash(files[0].bytes)}  ${files[0].name}`) throw new Error('Archive checksum disagrees.');
+            const report=JSON.parse(files[2].bytes.toString('utf8'));
+            if(report.version!==version || report.package_revision!==revision || report.target!==target ||
+               report.job_process_tree_cleanup!=='passed' || report.browser_html!=='passed' || report.conpty_process_spawn!=='passed') {
+              throw new Error('Qualification evidence is missing or disagrees.');
+            }
+            let release;
+            try { release=(await github.rest.repos.getReleaseByTag({owner,repo,tag})).data; }
+            catch(error) { if(error.status!==404) throw error; }
+            if(release && !release.draft) {
+              // Rebuilding a ZIP may change timestamps. Never overwrite an already published core.
+              core.info(`Release ${tag} already exists. Published bytes were left unchanged.`);
+              return;
+            }
+            if(!release) release=(await github.rest.repos.createRelease({owner,repo,tag_name:tag,target_commitish:context.sha,
+              name:`Orca core ${packageVersion} (Windows x64)`,draft:true,prerelease:false,make_latest:'false',
+              body:[`Repackaged official stablyai/orca ${version} under the upstream license.`,
+                '', 'The package contains pinned standalone Node, the Windows orcad slot and the official paired browser client.',
+                'See the attached validation report for the exact automated checks. WebView2 interaction and complete desktop feature parity require the Windows 11 manual acceptance run.',
+                '', 'The shell consumes this core release independently of its own binary.'].join('\n')})).data;
+            for(const file of files) {
+              const old=release.assets.find(x=>x.name===file.name);
+              if(old) {
+                if(old.digest!==`sha256:${hash(file.bytes)}`) throw new Error(`Draft asset ${file.name} differs; refusing to overwrite it.`);
+                continue;
+              }
+              await github.rest.repos.uploadReleaseAsset({owner,repo,release_id:release.id,name:file.name,data:file.bytes,
+                headers:{'content-type':'application/octet-stream','content-length':file.bytes.length}});
+            }
+            await github.rest.repos.updateRelease({owner,repo,release_id:release.id,draft:false,make_latest:'false'});
+            await core.summary.addHeading('Published qualified core').addLink(tag,release.html_url).write();
+
+  qualify-macos:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Download and qualify the pinned macOS Bun core
+        run: python3 scripts/extract-macos-core.py --download-orca --output dist-core
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qualified-macos-core
+          path: |
+            dist-core/bootstrap-core.json
+            dist-core/orca-core-*.zip
+            dist-core/orca-core-*.zip.sha256
+          if-no-files-found: error
+
+  publish-macos:
+    needs: qualify-macos
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' ||
+       (github.event_name == 'workflow_dispatch' && inputs.publish == true))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: qualified-macos-core
+          path: dist-core
+      - name: Publish qualified macOS core
+        run: |
+          cd dist-core
+          stable='(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'
+          version="$(jq -er --arg pattern "^v$stable$" '.version | select(test($pattern))' bootstrap-core.json)"
+          revision="$(jq -er --arg pattern "^$stable$" '.package_revision | select(test($pattern) and . != "0.0.0")' bootstrap-core.json)"
+          target="$(jq -er '.target | select(. == "aarch64-apple-darwin")' bootstrap-core.json)"
+          digest="$(jq -er '.sha256 | select(test("^[a-f0-9]{64}$"))' bootstrap-core.json)"
+          package_version="$revision-${version#v}"
+          tag="core-macos-v$package_version"
+          archive="orca-core-v$package_version-$target.zip"
+          test "$(cat "$archive.sha256")" = "$digest  $archive"
+          sha256sum --check "$archive.sha256"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft == false' | grep -qx true; then
+            echo "Release $tag is already published."
+            exit 0
+          fi
+          gh release create "$tag" "$archive" "$archive.sha256" \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --latest=false \
+            --title "Orca core $package_version (macOS arm64)" \
+            --notes "Qualified Bun/orcad package adapted from official Orca $version. Includes notices and upstream pin."

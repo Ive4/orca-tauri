@@ -1,0 +1,12 @@
+{
+  "installer_sha256": "676c32d9eb955a314356a220ffd8afbefc214f0f348a324620628353ad4535f3",
+  "schemaVersion": 4,
+  "checked_files": 337,
+  "checked_by_role": { "common": 322, "target": 14, "browser": 1 },
+  "checked_bytes": 78050972,
+  "failures": [],
+  "web_files": 1375,
+  "missing_web": [],
+  "web_bytes": 79078084,
+  "windows_runtime_executed": false
+}
