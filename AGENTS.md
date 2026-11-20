@@ -7,8 +7,8 @@ release validation.
 
 ## Preserve these invariants
 
-- Cold startup creates no WebView. Closing/toggling a window destroys it; never
-  replace this with a hidden always-alive window.
+- Background startup creates no WebView. Foreground startup opens the window
+  after core readiness. Closing or toggling off destroys the WebView.
 - Launch the pinned standalone runtime directly with `orcad-server.js`.
   Package Bun on macOS and Node on Windows.
   Do not switch to the official Electron launcher or enable its fallback.

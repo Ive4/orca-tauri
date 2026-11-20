@@ -1,8 +1,8 @@
 # orca-tauri
 
-Tauri v2 桌面壳在系统托盘常驻，按需创建官方 Orca 的浏览器客户端窗口，关闭时销毁 WebView。无头 Core 单独安装和更新。
+Tauri v2 桌面壳在系统托盘常驻，按需创建官方 Orca 的浏览器客户端窗口，关闭时销毁 WebView。打包应用随附无头 Core，启动时验证并激活。
 
-**先开发 Apple Silicon macOS 版，再完成 Windows 11 x64 版。** GitHub Actions 为两个平台打包随附初始 Core 的 Orca-Tauri，也支持独立发布 Core。
+**先开发 Apple Silicon macOS 版，再完成 Windows 11 x64 版。** GitHub Actions 为两个平台打包随附 Core 的 Orca-Tauri，也支持独立发布 Core。
 
 1. **macOS**。从官方安装包提取 `darwin-arm64` Core 槽及同版 Web 资源，用锁定的 arm64 Bun 启动。实机验证进程回收、配对与重连，再用同版本官方 Orca 对比启动到可操作、会话切换和整套进程内存。
 2. **Windows**。使用已有的 Windows x64 提取、ConPTY 和 Job 回收实现，完成 WebView2 实机配对、安装和性能验证。
@@ -13,18 +13,18 @@ Tauri v2 桌面壳在系统托盘常驻，按需创建官方 Orca 的浏览器�
 
 | 目标 | 实现 |
 | --- | --- |
-| 启动时不创建 WebView | `tauri.conf.json` 中 `windows: []`；默认只创建托盘并启动 Core。打包应用首次启动会安装随附的 Core。 |
+| 按需创建 WebView | `tauri.conf.json` 中 `windows: []`。普通启动等 Core 就绪后打开主窗口，后台启动只创建托盘并启动 Core。打包应用启动时自动安装随附的初始内核或更新版本。 |
 | 关闭即释放视图 | 原生关闭使用默认销毁；快捷键与托盘关闭使用 `WebviewWindow::destroy()`，不调用 `hide()`。 |
 | 单实例 | 官方 single-instance 插件首先注册；重复启动唤醒现有窗口，或在 core 就绪后创建窗口。 |
 | 快捷键 | 默认 `Ctrl+Shift+O`；macOS 为 `Command+Shift+O`。窗口存在则销毁，否则创建。 |
 | 开机启动 | 官方 autostart 插件，托盘开关；默认关闭，自启时传 `--background`。 |
 | 独立内核 | 版本目录在用户可写路径，core 不嵌入壳程序。 |
-| 无 Electron 回退 | 直接使用包内锁定的 Bun 或 Node 启动 `orcad-server.js`。 |
+| 无 Electron 回退 | 直接用包内运行时启动 `orcad-server.js`。macOS 使用 Bun，Windows 使用 Node。 |
 | Windows 树回收 | 创建时用 `PROC_THREAD_ATTRIBUTE_JOB_LIST` 加入 Job；`KILL_ON_JOB_CLOSE`，无 breakaway，Job 句柄不可继承。 |
 | 隐藏控制台 | 创建 core 使用 `CREATE_NO_WINDOW`；release 壳使用 Windows GUI 子系统。 |
 | 身份与健康验证 | 读取自己子进程的 JSON readiness，核对 PID、端口、运行时槽版本和终端自检，再检查真实浏览器 HTML。 |
-| 内核更新 | 从配置仓库的稳定核心 Release 选择当前平台的包，验证 SHA-256、安全解包、候选启动成功后原子提交活动指针。 |
-| 更新恢复 | 下载/解包/候选验证失败不改活动指针；候选进程完全退出后恢复原内核。保留上一版供手工回退。 |
+| 内核更新 | 打包应用通过应用更新获得随附内核。开发版可从配置仓库选择当前平台的稳定 Core Release。候选经 SHA-256 校验、安全解包和启动验证后才会激活。 |
+| 更新恢复 | 下载/解包/候选验证失败时保留活动指针，等待候选进程完全退出后恢复原内核。 |
 | 日志与代理 | core 标准输出中的配对秘密不落盘；stderr 做保守脱敏。localhost 检查直连；子进程与下载代理分别配置。 |
 
 ## 1. 从托盘查看版本
@@ -34,6 +34,8 @@ Tauri v2 桌面壳在系统托盘常驻，按需创建官方 Orca 的浏览器�
 1. **内核版本**显示 `<打包修订>-<官方版本>`。macOS 当前锁定 `0.0.4-1.4.266`，Windows 为 `0.0.1-1.4.266`。本地 Web UI 随内核更新。旧包缺少修订字段时，显示 `0.0.0-<官方版本>`。
 2. **外壳版本**来自 `src-tauri/Cargo.toml`，当前为 `0.1.0`。Tauri 安装包和外壳更新使用这个版本。
 3. **查询 Orca 官方最新稳定版…**读取 `stablyai/orca` 的最新稳定 Release，和当前激活的内核的官方基线比较。同一主、次版本可看到补丁版本号差值。
+
+安装或升级应用后，启动时会自动验证并启用随附的新内核。「关于与更新」只显示一个已激活的内核版本。已安装的同版或更新内核继续使用。随附候选验证失败时，等候选进程退出后恢复原内核。
 
 两个平台的 `core-version*.json` 分别固定 `version`（官方 Release 标签）和 `package_revision`（本项目打包修订）。同一个官方版本再次打包发布时，递增该平台的 `package_revision`。升级官方基线后可从 `0.0.1` 开始。清单中的 `environment.ORCA_VERSION` 供启动时核对运行时槽身份。
 
@@ -64,9 +66,19 @@ Windows v1.4.266 官方安装器已核对摘要，静态解包后逐项验证了
 
 可用 `--orca-app /path/to/Orca.app` 指定官方应用，或用 `--download-orca` 下载。脚本校验官方签名和文件摘要，再以锁定的上游源码、pnpm 依赖锁和项目补丁重建 `orcad-server.js` 与 Web 界面。可用 `--upstream-source-archive` 指向已下载的固定提交源码压缩包。打包前会运行原生模块加载、真实 PTY 和回环 HTTP 检查。应用声明的系统下限为 macOS 13.5。本地构建默认使用临时签名。
 
-点击菜单栏图标查看任务，在弹窗内选中任务或点击「打开 Orca」打开主窗口。**Command+Shift+O** 也可直接打开主窗口。空数据目录首启从应用资源安装 Core，核对就绪和配对信息后激活。已有 `~/.orca-tauri` 的有效 Core 优先启动。使用独立的绝对路径 `ORCA_TAURI_HOME` 可以试用另一种运行时。
+点击菜单栏图标查看任务，在弹窗内选中任务或点击「打开 Orca」打开主窗口。**Command+Shift+O** 也可直接打开主窗口。使用独立的绝对路径 `ORCA_TAURI_HOME` 可以在空数据目录中试用随包 Core。
 
 **首次打开与钥匙串。** WebKit 用应用的钥匙串项目保护本地配对密钥。若确认是刚安装的可信 Orca-Tauri 请求访问「Orca-Tauri WebCrypto Master Key」，选「始终允许」可为当前签名保存授权。临时签名（ad hoc）每次重建的身份可能不同。要让后续构建沿用授权，在已安装 Developer ID Application 证书和对应私钥的 Mac 上用同一个 `APPLE_SIGNING_IDENTITY` 运行 `scripts/build-macos.sh`。从已有临时签名迁移到正式签名时，系统可能要求确认一次。
+
+**macOS 窗口自动化。** 用 `./scripts/build-macos.sh --smoke-test` 构建 `Orca-Tauri Smoke.app`。每次构建使用独立的 Bundle ID，登录钥匙串处于解锁状态时，WebKit 会为测试包创建自己的主密钥。用新的 `ORCA_TAURI_HOME` 启动每个新测试包。测试重开窗口或重启应用时，复用同一个包和数据目录。
+
+```sh
+./scripts/build-macos.sh --smoke-test
+smoke_home="$(mktemp -d)"
+printf '%s\n' '{"port":26768,"notifications":false}' > "$smoke_home/config.json"
+ORCA_TAURI_HOME="$smoke_home" \
+  "target/aarch64-apple-darwin/release/bundle/macos/Orca-Tauri Smoke.app/Contents/MacOS/orca-tauri"
+```
 
 在 Orca 窗口的 **设置 → 插件** 中浏览官方目录，也可从本地目录或固定 Git 提交安装。该宿主支持数据插件、受信任的 Worker、脚本面板及允许在浏览器运行的自定义编辑器。宿主能力和验收范围见 [macOS 插件兼容](docs/macos-data-plugins.md)。旧版 Node 打包应用的首启和窗口生命周期记录见 [macOS 打包验收](docs/validation.md#apple-silicon-macos-打包验收)。
 
@@ -136,7 +148,7 @@ cargo tauri build --bundles nsis
 - **macOS 应用签名**。在仓库 Secrets 中配置 `APPLE_CERTIFICATE`（Base64 编码的 Developer ID Application `.p12`）和 `APPLE_CERTIFICATE_PASSWORD`。导出一套签名身份并沿用原应用标识。连续版本使用同一个签名身份，macOS 才能保留安装后授予的钥匙串权限。
 - 修改 `src-tauri/Cargo.toml` 的应用版本，运行 `cargo check --all-targets` 同步 `Cargo.lock`，提交两者后推送对应的标签（例如 `v0.1.1`）。两个平台均打包并签名成功后，工作流发布应用 Release、`latest.json` 和 SHA-256 校验清单。`latest.json` 按 `darwin-aarch64` 和 `windows-x86_64` 提供签名、更新地址、安装包地址和随附的内核／UI 版本。macOS 标签发布要求配置 Apple 签名证书，手动打包允许使用临时签名。Windows 安装器未做 Authenticode 签名。
 - **更新应用**。从公开 Release 安装的版本可在托盘选“设置 → 关于与更新 → 检查应用更新”。下载并校验签名成功后才会关闭窗口、回收内核任务并安装新版本。首次分发和手动打包产物可从 Release 下载安装器。
-- **更新内核和 UI**。用 **Qualify and release headless core** 验证两个平台的锁定包。在 `main` 手动运行并启用 `publish` 可发布独立内核，例如 `core-macos-v0.0.1-1.4.265` 或 `core-windows-v0.0.1-1.4.264`。托盘“设置 → 关于与更新 → 检查内核更新”从配置的 GitHub Releases 读取标签和 ZIP／SHA-256 资产。它匹配当前平台，先比较官方版本，同版时比较打包修订，再验证候选并切换活动包。上一版仍可回退。
+- **更新内核和 UI**。打包应用随应用更新内核和 Web UI。用 **Qualify and release headless core** 验证两个平台的锁定包。在 `main` 手动运行并启用 `publish` 可发布独立内核，例如 `core-macos-v0.0.4-1.4.266` 或 `core-windows-v0.0.1-1.4.266`。未随附内核的开发版可通过托盘「设置 → 关于与更新 → 检查内核更新」使用配置的 GitHub Releases 安装独立内核，也可从「高级」回退至上一版。
 
 ## 3. 数据布局与配置
 
@@ -175,7 +187,7 @@ cargo tauri build --bundles nsis
 | `update_repository` | 本地构建为 `null`；填实际的 `owner/repo`。CI 可编译写入默认值。 |
 | `download_proxy` | `null`；显式值支持 HTTP/HTTPS 代理，未指定则保留 reqwest 环境代理逻辑。 |
 | `start_core_on_launch` | `true`；有已安装 core 时在托盘启动它。 |
-| `open_window_on_start` | `false`；确保冷启动不创建 WebView。 |
+| `open_window_on_start` | `true`；普通启动时直接打开主窗口。`--background` 始终只在托盘启动。 |
 | `global_shortcut` | `CommandOrControl+Shift+O`。快捷键冲突时保留托盘操作并提示。 |
 | `autostart` | `false`；通常通过托盘开关修改。 |
 | `notifications` | `true`；原生操作失败或更新结果提示。 |
@@ -222,7 +234,7 @@ macOS 首版验收包括正常退出、启动失败回收和同端口重启。�
 
 正常路径：检查当前平台的稳定核心 Release → 下载并验证摘要 → 在 staging 安全解包 → 放入唯一版本目录 → 停旧 core → 启候选 core → 验证 stdout 身份、PTY 自检与浏览器 HTML → 原子提交 `active.json` → 恢复原来打开的窗口。
 
-下载/解包期间旧 core 持续运行。现有窗口可以唤醒或销毁。测试候选之前不改活动指针；在候选启动期间壳异常退出，下次仍按旧指针启动。进程切换期间打开窗口的请求会排队，不静默丢弃。
+独立更新下载和解包期间，旧 core 持续运行，现有窗口可以唤醒或销毁。候选验证成功前，活动指针保持为原版本。打包应用在下次启动时会重新尝试随附的候选。进程切换期间打开窗口的请求会排队。
 
 安全解包拒绝相对路径穿越、绝对路径、Windows ADS/设备名、符号链接、大小写冲突等。限制下载 1 GiB、单文件 512 MiB、总展开 2 GiB、80,000 条目以及 64 KiB manifest。下载资产名、目标架构和版本必须相符。
 
@@ -277,7 +289,7 @@ Windows 专用测试会创建持有 Job 的 owner、core 和孙进程，强杀 o
 
 ## 8. 常见问题
 
-**启动后没有窗口**：默认行为。用托盘“打开 Orca”或快捷键。
+**启动后没有窗口**：检查 `open_window_on_start` 是否为 `true`，并查看托盘中的 Core 状态。登录自启后可从托盘“打开 Orca”或使用快捷键。
 
 **更新菜单不可用**：先填实际 `update_repository`，退出并重开壳。首次本地构建没有预设 GitHub 仓库。
 
@@ -299,7 +311,7 @@ Windows 专用测试会创建持有 Job 的 owner、core 和孙进程，强杀 o
 
 - 探头猫在 macOS 使用系统模板图标，随菜单栏外观切换，深色菜单栏显示白色线稿。Windows 使用适合浅色任务栏的深色线稿。
 - **进行中**显示等待输入、受阻和正在运行的任务。需要处理的任务排在最前。「最近结束」显示过去 24 小时内，当前核心仍报告的已结束任务。
-- **设置 → 关于与更新**显示外壳和核心版本。检查更新只查询发布信息，确认安装后才下载、校验并按原流程安装。内核和随附 Web UI 一起切换。
-- **设置 → 高级**提供重启、停止、回退，以及配置和日志目录。停止、重启或回退会结束当前内核的任务。
+- **设置 → 关于与更新**显示外壳和内核版本。确认安装应用更新后，应用下载并验证安装包。下次启动时自动验证并启用随附的新内核和 Web UI。
+- **设置 → 高级**提供重启、停止，以及配置和日志目录。停止或重启会结束当前内核的任务。
 
 弹窗显示本应用内核报告的任务。通过「连接官方 Orca」配对的服务器在主窗口里查看。

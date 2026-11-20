@@ -25,8 +25,12 @@ use tauri_plugin_autostart::ManagerExt;
 
 const LABEL: &str = "tray-panel";
 const ENTRY: &str = "/tray/index.html";
-const WIDTH: f64 = 348.;
-const MAX_HEIGHT: f64 = 430.;
+const WIDTH: f64 = 320.;
+const MAX_HEIGHT: f64 = 420.;
+const SCREEN_INSET: f64 = 8.;
+const TRAY_GAP: f64 = 5.;
+#[cfg(target_os = "macos")]
+const CORNER_RADIUS: f64 = 24.;
 
 #[derive(Default)]
 struct Panel {
@@ -93,7 +97,8 @@ impl Anchor {
     }
 
     fn width(self) -> f64 {
-        WIDTH.min((self.work_right - self.work_left) / self.scale)
+        let work_width = (self.work_right - self.work_left) / self.scale;
+        WIDTH.min((work_width - 2. * SCREEN_INSET).max(1.))
     }
 
     fn below(self) -> bool {
@@ -108,11 +113,13 @@ impl Anchor {
         } else {
             self.top.min(self.work_bottom) - self.work_top
         };
-        (space / self.scale - 4.).clamp(64., MAX_HEIGHT).floor()
+        (space / self.scale - TRAY_GAP - SCREEN_INSET)
+            .clamp(1., MAX_HEIGHT)
+            .floor()
     }
 
     fn resize(self, window: &WebviewWindow, requested: f64) -> tauri::Result<()> {
-        let gap = 4. * self.scale;
+        let gap = TRAY_GAP * self.scale;
         let width = self.width() * self.scale;
         let below = self.below();
         let edge = if below {
@@ -120,14 +127,8 @@ impl Anchor {
         } else {
             self.top.min(self.work_bottom)
         };
-        let available = if below {
-            self.work_bottom - edge
-        } else {
-            edge - self.work_top
-        };
-        let height = (requested.clamp(64., MAX_HEIGHT) * self.scale).min((available - gap).max(1.));
-        let x =
-            (self.right + 14. * self.scale - width).clamp(self.work_left, self.work_right - width);
+        let height = requested.clamp(1., self.available()) * self.scale;
+        let x = self.horizontal_origin();
         let y = if below {
             edge + gap
         } else {
@@ -135,27 +136,31 @@ impl Anchor {
         };
         #[cfg(target_os = "macos")]
         {
-            window.set_position(tauri::LogicalPosition::new(x / self.scale, y / self.scale))?;
             window.set_size(tauri::LogicalSize::new(
                 width / self.scale,
                 height / self.scale,
-            ))
+            ))?;
+            window.set_position(tauri::LogicalPosition::new(x / self.scale, y / self.scale))
         }
         #[cfg(not(target_os = "macos"))]
         {
-            window.set_position(PhysicalPosition::new(x.round() as i32, y.round() as i32))?;
             window.set_size(PhysicalSize::new(
                 width.round() as u32,
                 height.round() as u32,
-            ))
+            ))?;
+            window.set_position(PhysicalPosition::new(x.round() as i32, y.round() as i32))
         }
     }
 
-    fn pointer(self) -> f64 {
+    fn horizontal_origin(self) -> f64 {
         let width = self.width() * self.scale;
-        let x =
-            (self.right + 14. * self.scale - width).clamp(self.work_left, self.work_right - width);
-        (((self.left + self.right) * 0.5 - x) / self.scale).clamp(12., self.width() - 12.)
+        let center = (self.left + self.right) / 2.;
+        let inset = (SCREEN_INSET * self.scale)
+            .min(((self.work_right - self.work_left - width) / 2.).max(0.));
+        (center - width / 2.).clamp(
+            self.work_left + inset,
+            (self.work_right - inset - width).max(self.work_left + inset),
+        )
     }
 
     fn contains_icon(self, position: PhysicalPosition<f64>) -> bool {
@@ -312,6 +317,31 @@ fn toggle(app: &AppHandle, point: PhysicalPosition<f64>, rect: Option<Rect>) {
     });
 }
 
+#[cfg(target_os = "macos")]
+fn install_glass(
+    webview: tauri::webview::PlatformWebview,
+    class: &'static objc2::runtime::AnyClass,
+) {
+    use objc2::{msg_send, rc::Retained};
+    use objc2_app_kit::{NSView, NSWindow};
+
+    // Tauri dispatches this callback on the main thread with a live NSWindow.
+    // The look-up above also allows the binary to run on macOS before 26.
+    unsafe {
+        let Some(window) = webview.ns_window().cast::<NSWindow>().as_ref() else {
+            return;
+        };
+        let Some(content) = window.contentView() else {
+            return;
+        };
+        let glass: Retained<NSView> = msg_send![class, new];
+        glass.setFrame(content.bounds());
+        let _: () = msg_send![&*glass, setCornerRadius: CORNER_RADIUS];
+        window.setContentView(Some(&glass));
+        let _: () = msg_send![&*glass, setContentView: &*content];
+    }
+}
+
 async fn toggle_panel(
     app: &AppHandle,
     point: PhysicalPosition<f64>,
@@ -342,7 +372,7 @@ async fn toggle_panel(
 
     let anchor = Anchor::at(app, point, rect)?;
     *panel.anchor.lock().unwrap() = Some(anchor);
-    let window = WebviewWindowBuilder::new(app, LABEL, WebviewUrl::App("tray/index.html".into()))
+    let builder = WebviewWindowBuilder::new(app, LABEL, WebviewUrl::App("tray/index.html".into()))
         .title("Orca 任务")
         .inner_size(anchor.width(), 360.)
         .visible(false)
@@ -369,8 +399,29 @@ async fn toggle_panel(
                 && url.query().is_none()
                 && url.fragment().is_none()
         })
-        .on_new_window(|_, _| NewWindowResponse::Deny)
-        .build()?;
+        .on_new_window(|_, _| NewWindowResponse::Deny);
+    #[cfg(target_os = "macos")]
+    let glass_class = objc2::runtime::AnyClass::get(c"NSGlassEffectView");
+    #[cfg(target_os = "macos")]
+    let builder = {
+        use tauri::window::{Effect, EffectsBuilder};
+        let builder = builder.initialization_script("window.__orcaTrayNativeMaterial = true;");
+        if glass_class.is_some() {
+            builder
+        } else {
+            builder.effects(
+                EffectsBuilder::new()
+                    .effect(Effect::Popover)
+                    .radius(CORNER_RADIUS)
+                    .build(),
+            )
+        }
+    };
+    let window = builder.build()?;
+    #[cfg(target_os = "macos")]
+    if let Some(class) = glass_class {
+        window.with_webview(move |webview| install_glass(webview, class))?;
+    }
     let popup = window.clone();
     let handle = app.clone();
     window.on_window_event(move |event| {
@@ -453,6 +504,7 @@ pub(crate) async fn tray_state(window: WebviewWindow, page: PanelPage) -> Result
             json!({
                 "appVersion": app.package_info().version.to_string(),
                 "coreVersion": active.as_ref().map(|core| core.manifest.display_version()),
+                "bundledCore": desktop::bundled_core_archive(app).is_some(),
                 "checkApp": app.config().plugins.0.contains_key("updater"),
                 "checkCore": state.settings().is_ok_and(|s| s.update_repository.is_some()),
                 "pendingApp": pending_app,
@@ -464,6 +516,7 @@ pub(crate) async fn tray_state(window: WebviewWindow, page: PanelPage) -> Result
         }
         PanelPage::Advanced => json!({
             "coreInstalled": state.updater.load_active().ok().flatten().is_some(),
+            "bundledCore": desktop::bundled_core_archive(app).is_some(),
             "rollbackAvailable": state.updater.load_previous().ok().flatten().is_some(),
             "running": core.phase == CorePhase::Running,
         }),
@@ -478,8 +531,6 @@ pub(crate) async fn tray_state(window: WebviewWindow, page: PanelPage) -> Result
         "busy": busy,
         "shell": shell,
         "message": (!matches!(page, PanelPage::Tasks)).then(|| state.message().chars().take(180).collect::<String>()),
-        "below": anchor.below(),
-        "pointer": anchor.pointer(),
         "availableHeight": anchor.available(),
     }))
 }
@@ -487,10 +538,14 @@ pub(crate) async fn tray_state(window: WebviewWindow, page: PanelPage) -> Result
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum PanelAction {
-    Resize { height: u16 },
+    Resize {
+        height: u16,
+    },
     Close,
     RetryTasks,
-    Open { id: Option<String> },
+    Open {
+        id: Option<String>,
+    },
     OpenPaired,
     CloseOrca,
     CheckApp,
@@ -514,6 +569,13 @@ pub(crate) async fn tray_action(window: WebviewWindow, action: PanelAction) -> R
         return Err("此窗口不能操作托盘".into());
     }
     let app = window.app_handle();
+    if matches!(
+        action,
+        PanelAction::CheckCore | PanelAction::InstallCore | PanelAction::Rollback
+    ) && desktop::bundled_core_archive(app).is_some()
+    {
+        return Err("此应用的内核随应用更新".into());
+    }
     let state = app.state::<Arc<AppState>>();
     let action = match action {
         PanelAction::Resize { height } => {
@@ -632,6 +694,30 @@ fn upstream_label(current: Option<&str>, latest: &Version) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn popup_centers_under_the_status_item_and_stays_inside_the_display() {
+        let anchor = Anchor {
+            left: 780.,
+            right: 820.,
+            top: 0.,
+            bottom: 48.,
+            work_left: 0.,
+            work_right: 1500.,
+            work_top: 48.,
+            work_bottom: 1000.,
+            scale: 2.,
+            tray_rect: true,
+        };
+        let width = anchor.width() * anchor.scale;
+        assert_eq!(anchor.horizontal_origin() + width / 2., 800.);
+        let edge = Anchor {
+            left: 1440.,
+            right: 1480.,
+            ..anchor
+        };
+        assert!(edge.horizontal_origin() + width < edge.work_right);
+    }
 
     #[test]
     fn upstream_label_compares_release_versions() {

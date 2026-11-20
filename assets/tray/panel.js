@@ -4,6 +4,7 @@ const get = id => document.getElementById(id);
 const invoke = (command, args) => window.__TAURI_INTERNALS__.invoke(command, args);
 const panel = get("panel");
 const list = get("list");
+document.body.toggleAttribute("data-native-material", window.__orcaTrayNativeMaterial === true);
 const states = { waiting: "等待输入", blocked: "受阻", monitoring: "监测中", unknown: "待确认", done: "已结束" };
 const providers = { codex: "Codex", claude: "Claude Code", cursor: "Cursor", opencode: "OpenCode", gemini: "Gemini", pi: "Pi" };
 let page = "tasks";
@@ -136,9 +137,15 @@ function go(next, focus) {
 }
 
 function option(text, handler, detail, disabled = false) {
-  const element = node(handler ? "button" : "div", "settings-row");
+  const element = node(handler ? "button" : "div", handler ? "settings-row" : "settings-row info");
   element.append(node("span", "", text));
-  if (detail) element.append(node("span", "", detail));
+  if (detail === "›") {
+    const chevron = node("i", "chevron");
+    chevron.setAttribute("aria-hidden", "true");
+    element.append(chevron);
+  } else if (detail) {
+    element.append(node("span", "version", detail));
+  }
   if (handler) {
     element.disabled = disabled;
     element.dataset.focus = text;
@@ -185,31 +192,41 @@ function renderSettings() {
     if (data.windowOpen) options.push(option("关闭 Orca 窗口", () => action("close_orca")));
     options.push(option("退出 Orca-Tauri", () => confirmAction("quit", "退出会停止后台运行的任务。", "退出")));
   } else if (page === "about") {
-    options.push(option("Orca-Tauri", null, data.appVersion), option("Orca 核心", null, data.coreVersion || "尚未安装"));
+    const versions = node("div", "settings-section");
+    versions.append(option("Orca-Tauri", null, data.appVersion), option("内核", null, data.coreVersion || "尚未安装"));
+    options.push(versions);
+    const updates = node("div", "settings-section");
     for (const [family, allowed, version] of [["app", data.checkApp, data.pendingApp], ["core", data.checkCore, data.pendingCore]]) {
+      if (family === "core" && data.bundledCore) continue;
       const label = family === "app" ? "应用" : "内核";
       if (!allowed) {
-        options.push(option(`${label}更新`, null, family === "app" ? "当前版本未启用" : "未配置更新源"));
+        updates.append(option(`${label}更新`, null, family === "app" ? "未启用" : "未配置更新源"));
       } else if (version) {
         const disruption = family === "app" ? "安装会停止后台任务并重启应用。" : "安装会停止后台任务并重启内核。";
-        options.push(option(`安装${label}更新…`, () => confirmAction(`install_${family}`, disruption, "安装并重启"), version, locked));
+        updates.append(option(`安装${label}更新…`, () => confirmAction(`install_${family}`, disruption, "安装并重启"), version, locked));
       } else {
-        options.push(option(`检查${label}更新`, () => action(`check_${family}`), "", locked));
+        updates.append(option(`检查${label}更新`, () => action(`check_${family}`), "", locked));
       }
     }
-    options.push(option("查询官方最新版本", () => action("check_official"), data.officialVersion || "", locked));
+    updates.append(option("查询官方最新版本", () => action("check_official"), data.officialVersion || "", locked));
+    options.push(updates);
   } else {
     options.push(
       option("重启内核 / 重新配对", () => confirmAction("restart", "重启会停止此内核运行中的任务。", "重启"), "", locked || !data.coreInstalled),
       option("停止内核", () => confirmAction("stop", "停止内核会结束正在运行的任务。", "停止"), "", locked || !data.running),
-      option("回退内核", () => confirmAction("rollback", "回退会停止正在运行的任务。", "回退"), "", locked || !data.rollbackAvailable),
+    );
+    if (!data.bundledCore) {
+      options.push(option("回退内核", () => confirmAction("rollback", "回退会停止正在运行的任务。", "回退"), "", locked || !data.rollbackAvailable));
+    }
+    options.push(
       option("打开配置文件", () => action("config")),
       option("打开日志目录", () => action("logs")),
       option("打开数据目录", () => action("data")),
     );
   }
   get("settings-content").replaceChildren(...options);
-  showNotice("settings-message", error || (page !== "advanced" || snapshot.busy ? snapshot.message : ""));
+  const message = ["窗口已打开", "窗口已关闭", "内核运行中", "官方版本查询完成"].includes(snapshot.message) ? "" : snapshot.message;
+  showNotice("settings-message", error || message);
 }
 
 function render(force = false) {
@@ -229,8 +246,6 @@ async function refresh() {
     const response = await invoke("tray_state", { page });
     if (id !== request) return;
     snapshot = response;
-    document.body.classList.toggle("above", !snapshot.below);
-    document.documentElement.style.setProperty("--pointer", `${snapshot.pointer}px`);
     document.documentElement.style.setProperty("--available", `${snapshot.availableHeight}px`);
     render();
   } catch {
@@ -263,7 +278,7 @@ document.addEventListener("keydown", event => {
 
 function measure() {
   if (!ready) return;
-  wantedHeight = Math.ceil(panel.getBoundingClientRect().height + 6);
+  wantedHeight = Math.ceil(panel.getBoundingClientRect().height);
   void resize();
 }
 

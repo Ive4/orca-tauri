@@ -13,7 +13,7 @@ pub enum Target {
 }
 
 impl Target {
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Local => "orca",
             Self::Paired => "orca-paired",
@@ -133,6 +133,13 @@ async fn show_with_task(
                 && payload.url().origin() == startup_origin
                 && first_load.swap(false, Ordering::Relaxed)
             {
+                #[cfg(target_os = "macos")]
+                if let Err(error) = window
+                    .app_handle()
+                    .set_activation_policy(tauri::ActivationPolicy::Regular)
+                {
+                    tracing::warn!(%error, "could not activate the Orca application menu");
+                }
                 let _ = window.show();
                 let _ = window.set_focus();
             }

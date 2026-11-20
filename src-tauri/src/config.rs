@@ -46,7 +46,7 @@ impl Default for Config {
                 .map(str::to_owned),
             download_proxy: None,
             start_core_on_launch: true,
-            open_window_on_start: false,
+            open_window_on_start: true,
             autostart: false,
             global_shortcut: "CommandOrControl+Shift+O".into(),
             notifications: true,

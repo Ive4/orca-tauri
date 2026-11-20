@@ -321,20 +321,42 @@ async fn ensure_started(app: &AppHandle, state: &AppState) -> Result<()> {
     if state.core.status().phase == CorePhase::Running {
         return Ok(());
     }
-    if let Some(installed) = state.updater.load_active()? {
-        state.set_message(app, "正在启动内核…");
-        start_core(state, &installed).await?;
-    } else {
-        let archive = bundled_core_archive(app).context(
-            "尚未安装内核：设置 config.json 的 update_repository，然后使用托盘“设置 → 关于与更新 → 检查内核更新”",
-        )?;
-        install_bundled_core(app, state, &archive).await?;
+    let active = state.updater.load_active()?;
+    if let Some(archive) = bundled_core_archive(app) {
+        match install_bundled_core(app, state, &archive, active.as_ref()).await {
+            Ok(true) => {
+                state.set_message(app, "内核运行中");
+                return Ok(());
+            }
+            Ok(false) => {}
+            Err(error) => {
+                state
+                    .core
+                    .stop()
+                    .await
+                    .with_context(|| format!("随附内核启动失败，进程回收尚未完成：{error:#}"))?;
+                let Some(installed) = &active else {
+                    return Err(error);
+                };
+                tracing::warn!(%error, "could not activate bundled core");
+                start_core(state, installed)
+                    .await
+                    .context("随附内核启动失败，恢复已安装内核也失败")?;
+                state.set_message(app, "随附内核启动失败，已恢复原内核");
+                return Ok(());
+            }
+        }
     }
+    let installed = active.context(
+        "尚未安装内核：设置 config.json 的 update_repository，然后使用托盘“设置 → 关于与更新 → 检查内核更新”",
+    )?;
+    state.set_message(app, "正在启动内核…");
+    start_core(state, &installed).await?;
     state.set_message(app, "内核运行中");
     Ok(())
 }
 
-fn bundled_core_archive(app: &AppHandle) -> Option<std::path::PathBuf> {
+pub(crate) fn bundled_core_archive(app: &AppHandle) -> Option<std::path::PathBuf> {
     let archive = app.path().resource_dir().ok()?.join("bootstrap-core.zip");
     archive.is_file().then_some(archive)
 }
@@ -354,9 +376,22 @@ async fn bundled_core_identity(archive: &Path) -> Result<BundledCoreIdentity> {
     serde_json::from_slice(&identity).context("parse bundled core identity")
 }
 
-async fn install_bundled_core(app: &AppHandle, state: &AppState, archive: &Path) -> Result<()> {
-    state.set_message(app, "正在校验随附内核…");
+async fn install_bundled_core(
+    app: &AppHandle,
+    state: &AppState,
+    archive: &Path,
+    active: Option<&InstalledCore>,
+) -> Result<bool> {
     let seed = bundled_core_identity(archive).await?;
+    if let Some(active) = active {
+        if !active
+            .manifest
+            .is_older_than(&seed.version, seed.package_revision.as_deref())?
+        {
+            return Ok(false);
+        }
+    }
+    state.set_message(app, "正在校验随附内核…");
     let session = state.updater.begin_update().await;
     let core = session
         .prepare_local_archive(archive, &seed.version, &seed.sha256)
@@ -370,16 +405,8 @@ async fn install_bundled_core(app: &AppHandle, state: &AppState, archive: &Path)
         "bundled core identity differs from package manifest"
     );
     start_core(state, &core).await?;
-    let activation = activate_started_core(state, || session.commit(&core));
-    if let Err(error) = activation {
-        state
-            .core
-            .stop()
-            .await
-            .with_context(|| format!("clean up bundled core after failed activation: {error:#}"))?;
-        return Err(error);
-    }
-    Ok(())
+    activate_started_core(state, || session.commit(&core))?;
+    Ok(true)
 }
 
 async fn start_core(state: &AppState, core: &InstalledCore) -> Result<()> {
@@ -651,6 +678,36 @@ fn report(app: &AppHandle, state: &AppState, error: anyhow::Error) {
     );
 }
 
+#[cfg(target_os = "macos")]
+fn macos_menu(app: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
+    use tauri::menu::{AboutMetadata, Menu, MenuItem, PredefinedMenuItem, Submenu};
+
+    let menu = Menu::default(app)?;
+    let package = app.package_info();
+    let about = AboutMetadata {
+        name: Some(package.name.clone()),
+        version: Some(package.version.to_string()),
+        ..Default::default()
+    };
+    let app_menu = Submenu::with_items(
+        app,
+        &package.name,
+        true,
+        &[
+            &PredefinedMenuItem::about(app, None, Some(about))?,
+            &PredefinedMenuItem::separator(app)?,
+            &PredefinedMenuItem::hide(app, None)?,
+            &PredefinedMenuItem::hide_others(app, None)?,
+            &PredefinedMenuItem::separator(app)?,
+            &MenuItem::with_id(app, "quit-orca", "退出 Orca-Tauri", true, Some("Cmd+Q"))?,
+        ],
+    )?;
+    // Route Cmd+Q through the owned core's graceful shutdown.
+    menu.remove_at(0)?;
+    menu.insert(&app_menu, 0)?;
+    Ok(menu)
+}
+
 pub fn run() -> Result<()> {
     let root = AppPaths::discover()?;
     let config = Config::load_or_create(&root)?;
@@ -698,8 +755,10 @@ pub fn run() -> Result<()> {
             tray::tray_action
         ])
         // This plugin must precede all other plugins and runtime creation.
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            request(app, Action::Show)
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            if !args.iter().any(|arg| arg == "--background") {
+                request(app, Action::Show);
+            }
         }))
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
@@ -715,6 +774,15 @@ pub fn run() -> Result<()> {
             Some(vec!["--background"]),
         ))
         .plugin(tauri_plugin_notification::init());
+    #[cfg(target_os = "macos")]
+    let builder = builder
+        .activate_ignoring_other_apps(false)
+        .menu(macos_menu)
+        .on_menu_event(|app, event| {
+            if event.id().as_ref() == "quit-orca" {
+                quit(app);
+            }
+        });
     let builder = if context.config().plugins.0.contains_key("updater") {
         builder.plugin(tauri_plugin_updater::Builder::new().build())
     } else {
@@ -851,6 +919,33 @@ pub fn run() -> Result<()> {
         .build(context)
         .context("initialize desktop shell")?;
     app.run(move |app, event| match event {
+        #[cfg(target_os = "macos")]
+        RunEvent::WindowEvent {
+            label,
+            event: tauri::WindowEvent::Destroyed,
+            ..
+        } if [window::Target::Local, window::Target::Paired]
+            .into_iter()
+            .any(|target| label == target.label())
+            && window::current(app).is_none() =>
+        {
+            if let Err(error) = app.set_activation_policy(tauri::ActivationPolicy::Accessory) {
+                tracing::warn!(%error, "could not return Orca to the menu bar");
+            }
+        }
+        #[cfg(target_os = "macos")]
+        RunEvent::Reopen {
+            has_visible_windows,
+            ..
+        } if !has_visible_windows || window::current(app).is_none() => {
+            request(
+                app,
+                match window::current(app) {
+                    Some(window::Target::Paired) => Action::ShowPaired,
+                    _ => Action::Show,
+                },
+            );
+        }
         RunEvent::ExitRequested { api, code, .. } => {
             // Destroying the last window can request an implicit exit even
             // during quit(). Keep the event loop alive until cleanup calls exit().

@@ -4,7 +4,7 @@
   "update_repository": "YOUR_GITHUB_OWNER/orca-tauri",
   "download_proxy": null,
   "start_core_on_launch": true,
-  "open_window_on_start": false,
+  "open_window_on_start": true,
   "autostart": false,
   "global_shortcut": "CommandOrControl+Shift+O",
   "notifications": true,

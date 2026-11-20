@@ -67,6 +67,13 @@ impl CoreManifest {
         display_core_version(&self.version, self.package_revision.as_deref())
     }
 
+    pub(crate) fn is_older_than(&self, version: &str, revision: Option<&str>) -> Result<bool> {
+        Ok(
+            core_version_key(&self.version, self.package_revision.as_deref())?
+                < core_version_key(version, revision)?,
+        )
+    }
+
     /// The orcad slot identifies itself with this build version in readiness.
     pub fn runtime_slot_version(&self) -> Option<&str> {
         self.environment.get("ORCA_VERSION").map(String::as_str)
@@ -107,10 +114,7 @@ impl CoreRelease {
     }
 
     pub fn is_newer_than(&self, installed: &CoreManifest) -> Result<bool> {
-        Ok(
-            core_version_key(&self.version, self.package_revision.as_deref())?
-                > core_version_key(&installed.version, installed.package_revision.as_deref())?,
-        )
+        installed.is_older_than(&self.version, self.package_revision.as_deref())
     }
 }
 
